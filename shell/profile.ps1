@@ -35,6 +35,7 @@ $kCmdPattern = @(
 ) -join '|'
 
 function global:Test-KtermCmdLine([string]$line) {
+    if ($line -match '^\s*assign\b') { return $false }  # `assign --run del %temp%` stores the cmd line, not runs it
     if ($line -match $kCmdPattern) { return $true }
     # Windows PowerShell 5.1 has no && / ||; cmd does.
     return $PSVersionTable.PSVersion.Major -lt 7 -and $line -match '&&|\|\|'
@@ -443,6 +444,12 @@ function global:open {
     $stay = $args -contains '--stay'
     $q = "$($args | Where-Object { $_ -ne '--stay' })".Trim()
     if (-not $q) { 'usage: open <app, game, file, folder or url> [--stay]'; return }
+    $a = Get-KtermAssigns | Where-Object name -eq $q | Select-Object -First 1
+    if ($a.run) {
+        if (Test-KtermCmdLine $a.target) { cmd /d /c $a.target } else { Invoke-Expression $a.target }
+        return
+    }
+    if ($a) { $q = $a.target }
     $ok = $true
     if ($q -match '^\w[\w+.-]*://') {
         Start-Process $q
@@ -474,6 +481,51 @@ function global:open {
     # The running command joins the history only once it finishes, so no growth since the first
     # prompt means this is the first command.
     if ($ok -and -not $stay -and (Get-History).Count -eq $global:kHistBase) { exit }
+}
+
+# ---- `assign --in <name> --out <target>`: a name `open` understands (link, file, folder, app) --
+#   assign --in <name> --run <command...>   `open <name>` runs it (cmd or PowerShell); quote it if it has ; | &
+#   assign                    list them
+#   assign --remove <name>    forget one
+$kAssignPath = "$env:APPDATA\kterm\assigns.json"
+
+function global:Get-KtermAssigns {
+    if (Test-Path $kAssignPath) { try { return @(Get-Content $kAssignPath -Raw | ConvertFrom-Json | ForEach-Object { $_ }) } catch {} }
+    @()
+}
+
+function global:assign {
+    $in = $out = $rm = $run = $null
+    for ($i = 0; $i -lt $args.Count; $i++) {
+        switch ($args[$i]) {
+            '--in' { $in = $args[++$i] }
+            '--out' { $out = $args[++$i] }
+            '--remove' { $rm = $args[++$i] }
+            '--run' { $run = $args[($i + 1)..($args.Count - 1)] -join ' '; $i = $args.Count }  # takes the rest of the line
+        }
+    }
+    $list = Get-KtermAssigns
+    if ($rm) {
+        if (-not ($list | Where-Object name -eq $rm)) { "assign: nothing called '$rm'"; return }
+        $list = @($list | Where-Object name -ne $rm)
+        "  Removed $rm"
+    } elseif ($in -and $run) {
+        $list = @($list | Where-Object name -ne $in) + [pscustomobject]@{ name = $in; target = $run; run = $true }
+        "  open $in  ->  runs: $run"
+    } elseif ($in -and $out) {
+        # Pin files to their full path (works from any folder); bare domains become https links.
+        if ($out -notmatch '^\w[\w+.-]*://') {
+            if (Test-Path -LiteralPath $out) { $out = (Resolve-Path -LiteralPath $out).ProviderPath }
+            elseif ($out -match '^[\w-]+(\.[\w-]+)+(/|$)') { $out = "https://$out" }
+        }
+        $list = @($list | Where-Object name -ne $in) + [pscustomobject]@{ name = $in; target = $out }
+        "  open $in  ->  $out"
+    } elseif (-not $args.Count) {
+        if (-not $list) { 'No assigns yet. usage: assign --in <name> --out <link, file, folder or app>' }
+        $list | ForEach-Object { "  $($_.name)  ->  $(if ($_.run) { 'runs: ' })$($_.target)" }
+        return
+    } else { 'usage: assign --in <name> --out <link, file, folder or app>   |   --run <command>   |   assign --remove <name>'; return }
+    [IO.File]::WriteAllText($kAssignPath, (ConvertTo-Json @($list)))
 }
 
 # Running processes whose name or description contains $q (never this shell itself).
@@ -555,6 +607,39 @@ if ($kIsAdmin -and (Test-Path $kAdminCwd)) {
 
 # ---- `terminate`: close kterm as a whole (every window and tab) --------------------------------
 function global:terminate { Get-Process kterm -ErrorAction SilentlyContinue | Stop-Process -Force; exit }
+
+# ---- `version`: the running kterm's version (stamped into the exe from Cargo.toml) -------------
+function global:version {
+    $exe = (Get-Process kterm -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+    if (-not $exe) { 'version: kterm is not running'; return }
+    "kterm v$((Get-Item $exe).VersionInfo.ProductVersion)"
+}
+
+# ---- `help`: every kterm command at a glance (`help <topic>` is still PowerShell's help) -------
+function global:help {
+    if ($args) { Get-Help @args | more; return }
+    $acc = $global:kAccent
+    "`n  $e[1;${acc}mKTerm commands$e[0m`n"
+    $cmds = [ordered]@{
+        'config' = 'live settings menu: font, opacity, cursor, accent, tiling, key binds'
+        'hideme' = 'star out your username in the prompt (run again to show it)'
+        'keybinds' = 'browse Windows hotkeys and switch them on/off  (keybinds disable|enable <key>)'
+        'open <name>' = 'open an app, game, file, folder, link or assign  (--stay keeps the window)'
+        'assign' = 'name a link/file/app for open  (assign --in <name> --out <target> | --run <command>, --remove <name>)'
+        'close <name>' = 'end a running app  (--all ends every match)'
+        'hide <name>' = 'send an app''s windows to the tray; show <name> brings them back'
+        'fetch <url>' = 'download a link; videos via yt-dlp  (-Audio -Quality 720 -Format mkv -Out <path>)'
+        'benchmark' = 'live CPU / GPU / memory of kterm  (--peak draws in place)'
+        'admin' = 'reopen this terminal elevated, same folder'
+        'version' = 'show the running kterm version'
+        'kterm-update' = 'install the latest release'
+        'terminate' = 'close kterm entirely (every window)'
+    }
+    foreach ($k in $cmds.Keys) { "  $e[1m$($k.PadRight(14))$e[0m $($cmds[$k])" }
+    "`n  $e[2mAlso: Linux commands (grep, sed, awk, less, ...) and cmd syntax (%VAR%, dir /s, ...) just work.$e[0m"
+    $c = Get-KtermConfig
+    "  $e[2mKeys: $($c.key_toggle) show/hide, $($c.key_new) new window, $($c.key_close) close, $($c.key_hide) hide, $($c.key_copy)/$($c.key_paste) copy/paste$e[0m`n"
+}
 
 # ---- `hide <name>` / `show <name>`: send an app's windows to the tray (or nowhere) and back -----
 # Like Medal's own "hide": the window and its taskbar button go away, the app keeps running, and
@@ -739,7 +824,7 @@ function global:fetch {
 $kRelease = "$env:APPDATA\kterm\latest-release.json"
 
 function global:Get-KtermRelease {
-    try { Get-Content $kRelease -Raw | ConvertFrom-Json } catch {}
+    try { Get-Content $kRelease -Raw -ErrorAction Stop | ConvertFrom-Json } catch {}  # no cache yet on first run
 }
 
 function global:kterm-update {
