@@ -553,6 +553,9 @@ if ($kIsAdmin -and (Test-Path $kAdminCwd)) {
     Remove-Item $kAdminCwd
 }
 
+# ---- `terminate`: close kterm as a whole (every window and tab) --------------------------------
+function global:terminate { Get-Process kterm -ErrorAction SilentlyContinue | Stop-Process -Force; exit }
+
 # ---- `hide <name>` / `show <name>`: send an app's windows to the tray (or nowhere) and back -----
 # Like Medal's own "hide": the window and its taskbar button go away, the app keeps running, and
 # its tray icon (if it has one) still opens it. `show` brings back what `hide` hid.
@@ -727,6 +730,49 @@ function global:fetch {
     # Mark of the Web, like a browser download: Windows SmartScreen checks it before running it.
     Set-Content -LiteralPath $path -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3`r`nHostUrl=$final"
     "  Saved $path ({0:N0} KB)" -f ((Get-Item -LiteralPath $path).Length / 1KB)
+}
+
+# ---- Updates: new shells say when GitHub has a newer release; `kterm-update` installs it -------
+# The latest release is cached in %APPDATA%\kterm and refreshed in the background, so startup never
+# waits on the network. ponytail: a release is noticed by the shell after the refresh, not the one that started it.
+
+$kRelease = "$env:APPDATA\kterm\latest-release.json"
+
+function global:Get-KtermRelease {
+    try { Get-Content $kRelease -Raw | ConvertFrom-Json } catch {}
+}
+
+function global:kterm-update {
+    $r = Get-KtermRelease
+    $asset = $r.assets | Where-Object name -like 'KTerm-Setup-*.exe' | Select-Object -First 1
+    if (-not $asset) { 'kterm-update: no installer found on the latest release'; return }
+    $path = Join-Path $env:TEMP $asset.name
+    curl.exe -L --fail -# -o $path $asset.browser_download_url
+    if ($LASTEXITCODE) { "kterm-update: download failed (curl exit $LASTEXITCODE)"; return }
+    "  KTerm closes, updates and reopens by itself."
+    Start-Process $path '/SILENT'
+}
+
+if ($env:KTERM_VERSION) {
+    $kAge = (Get-Item $kRelease -ErrorAction SilentlyContinue).LastWriteTime
+    if (-not $kAge -or $kAge -lt (Get-Date).AddHours(-6)) {
+        # Written to a temp file and moved, so a shell starting mid-download never reads half of it.
+        Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c', "curl.exe -sfL --max-time 20 -o `"$kRelease.tmp`" https://api.github.com/repos/kennumi/kterm/releases/latest && move /y `"$kRelease.tmp`" `"$kRelease`" >nul"
+    }
+    $r = Get-KtermRelease
+    $latest = "$($r.tag_name)".TrimStart('v')
+    if ($latest -as [version] -and [version]$latest -gt [version]$env:KTERM_VERSION) {
+        $asked = "$env:APPDATA\kterm\update-asked.txt"
+        if ((Get-Content $asked -ErrorAction SilentlyContinue) -ne $latest) {
+            Set-Content $asked $latest
+            Write-Host "  $e[1;38;2;${global:kAccent}mKTerm $latest is available$e[0m (you have $env:KTERM_VERSION). Download and install it now? [y/N] " -NoNewline
+            $yes = [Console]::ReadKey($true).KeyChar -eq 'y'
+            Write-Host $(if ($yes) { 'y' } else { 'n' })
+            if ($yes) { kterm-update } else { "  $e[2mRun kterm-update whenever you're ready.$e[0m" }
+        } else {
+            "  $e[2mKTerm $latest is available (you have $env:KTERM_VERSION). Run kterm-update to install it.$e[0m"
+        }
+    }
 }
 
 # ---- Arch-style prompt:  user@host ~/path >  (accent colored, red after a failure) -----------

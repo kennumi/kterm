@@ -38,7 +38,7 @@ WizardImageBackColor=#111317
 WizardSmallImageBackColor=#111317
 WizardImageFile={#Welcome}
 WizardSmallImageFile={#Small}
-; KTerm idles hidden in the background (Win+Enter), so upgrades must be allowed to stop it.
+; Upgrades stop the installed KTerm themselves (see [Code]); this only catches anything else holding the files.
 CloseApplications=force
 RestartApplications=no
 
@@ -71,8 +71,33 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\kterm.e
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\ktm.exe"; ValueType: string; ValueData: "{app}\kterm.exe"; Flags: uninsdeletekey
 
 [Run]
-Filename: "{app}\kterm.exe"; Description: "Open KTerm now"; Flags: nowait postinstall skipifsilent
+; Upgrade: bring back the KTerm we stopped, even when silent. Fresh install: offer to open it.
+Filename: "{app}\kterm.exe"; Flags: nowait; Check: WasRunning
+Filename: "{app}\kterm.exe"; Description: "Open KTerm now"; Flags: nowait postinstall skipifsilent; Check: not WasRunning
 
 [UninstallRun]
 ; Stop only the installed copy, not dev builds running from elsewhere.
 Filename: "powershell.exe"; Parameters: "-NoProfile -Command ""Get-Process kterm -EA 0 | ? Path -eq '{app}\kterm.exe' | Stop-Process -Force"""; Flags: runhidden; RunOnceId: "StopKTerm"
+
+[Code]
+var
+  KTermWasRunning: Boolean;
+
+function WasRunning: Boolean;
+begin
+  Result := KTermWasRunning;
+end;
+
+// Runs right before files are copied: stop the installed KTerm (it usually idles hidden, with no
+// window to close) and remember whether it was running. Dev builds elsewhere are left alone.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Code: Integer;
+begin
+  Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    '-NoProfile -Command "$p = Get-Process kterm -EA 0 | ? Path -eq ''' + ExpandConstant('{app}') + '\kterm.exe''; ' +
+    'if ($p) { $p | Stop-Process -Force; $p | Wait-Process -Timeout 5 -EA 0; exit 10 }"',
+    '', SW_HIDE, ewWaitUntilTerminated, Code);
+  KTermWasRunning := Code = 10;
+  Result := '';
+end;

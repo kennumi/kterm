@@ -102,6 +102,7 @@ impl Session {
                 ("TERM", "xterm-256color".into()),
                 ("COLORTERM", "truecolor".into()),
                 ("TERM_PROGRAM", "kterm".into()),
+                ("KTERM_VERSION", env!("CARGO_PKG_VERSION").into()),
                 ("KTERM_ACCENT", format!("{};{};{}", accent[0], accent[1], accent[2])),
             ]
             .map(|(k, v)| (k.to_string(), v))
