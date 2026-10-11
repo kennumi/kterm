@@ -424,7 +424,7 @@ pub fn self_update() -> std::io::Result<()> {
         "Get-Process kterm -EA 0 | ? Path -eq '{d}' | Stop-Process -Force; Start-Sleep -Milliseconds 700; \
          Copy-Item '{s}' '{d}' -Force; Start-Process '{d}' '--hidden'; Start-Sleep 1; Start-Process '{d}'"
     );
-    // CREATE_NO_WINDOW | DETACHED_PROCESS
-    std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).creation_flags(0x0800_0200).spawn()?;
+    // CREATE_NO_WINDOW. Not CREATE_NEW_PROCESS_GROUP: it switches off Ctrl+C for the restarted kterm and every shell in it.
+    std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).creation_flags(0x0800_0000).spawn()?;
     Ok(())
 }

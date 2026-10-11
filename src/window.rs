@@ -18,7 +18,7 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape, CursorStyle, NamedColor,
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta};
 use winit::event_loop::EventLoopProxy;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::platform::windows::WindowExtWindows;
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
@@ -379,9 +379,10 @@ impl TermWin {
             return false;
         }
         // Ctrl+C copies when there is a selection, otherwise it is the shell's interrupt.
-        if let Key::Character(c) = &ev.logical_key
-            && m.control_key() && !m.alt_key() && !m.shift_key() && c.eq_ignore_ascii_case("c")
-            && self.s.term.lock().selection.is_some()
+        // A plain click leaves an empty selection behind; that must not eat the interrupt.
+        if m.control_key() && !m.alt_key() && !m.shift_key()
+            && ctrl_letter(&ev).as_deref() == Some("c")
+            && self.s.term.lock().selection.as_ref().is_some_and(|s| !s.is_empty())
         {
             self.copy();
             return false;
@@ -764,6 +765,18 @@ pub fn grid_size(window: &Window, sh: &mut Shared) -> WindowSize {
     }
 }
 
+/// The key as ASCII for Ctrl combos. Non-Latin layouts (Cyrillic, Greek...) report their own
+/// letter, so fall back to the physical key: Ctrl+C means the C key there too.
+fn ctrl_letter(ev: &KeyEvent) -> Option<String> {
+    let Key::Character(c) = &ev.logical_key else { return None };
+    if c.is_ascii() {
+        return Some(c.to_lowercase());
+    }
+    let PhysicalKey::Code(code) = ev.physical_key else { return None };
+    let name = format!("{code:?}"); // "KeyC"
+    name.strip_prefix("Key").filter(|l| l.len() == 1).map(str::to_lowercase)
+}
+
 /// Keyboard event to the bytes a VT application expects (xterm encoding).
 fn key_bytes(ev: &KeyEvent, m: ModifiersState, app_cursor: bool) -> Option<Vec<u8>> {
     let (shift, alt, ctrl) = (m.shift_key(), m.alt_key(), m.control_key());
@@ -810,8 +823,8 @@ fn key_bytes(ev: &KeyEvent, m: ModifiersState, app_cursor: bool) -> Option<Vec<u
             NamedKey::F12 => tilde(24),
             _ => return ev.text.as_deref().map(|t| alt_prefix(t.as_bytes())),
         },
-        Key::Character(c) => {
-            if ctrl && !alt && let [b] = c.as_bytes() {
+        Key::Character(_) => {
+            if ctrl && !alt && let Some(c) = ctrl_letter(ev) && let [b] = c.as_bytes() {
                 let code = match b.to_ascii_lowercase() {
                     b @ b'a'..=b'z' => Some(b & 0x1f),
                     b'[' | b'3' => Some(0x1b),

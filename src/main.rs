@@ -417,6 +417,9 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 fn main() {
+    // "Ignore Ctrl+C" is inherited from whatever launched us (a new process group, some launchers)
+    // and passed on to every shell, where Ctrl+C would then do nothing. Clear it.
+    let _ = unsafe { windows::Win32::System::Console::SetConsoleCtrlHandler(None, false) };
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--install") {
         if let Err(e) = win::install_autostart() {

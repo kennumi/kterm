@@ -27,7 +27,7 @@ pub struct Config {
     pub tiling: bool,     // off: new windows cascade over the others instead
     pub gaps: f32,        // tiling gaps, logical px
     pub hide_user: bool,  // shell prompt + on-screen masking of %USERNAME%
-    // Key binds, "ctrl+shift+h" style: ctrl/shift/alt/win + a letter, digit, f1-f12, escape, enter, tab, space...
+    // Key binds, "ctrl+shift+h" style: ctrl/shift/alt/win + a letter, digit, f1-f12, escape, enter, tab, space, `...
     pub key_toggle: String, // global: open / hide KTerm from anywhere
     pub key_new: String,    // global: open another window
     pub key_close: String,
@@ -132,6 +132,7 @@ impl Bind {
             "tab" => 0x09,
             "space" => 0x20,
             "backspace" => 0x08,
+            "`" | "grave" | "backtick" => 0xC0, // VK_OEM_3 on US layouts
             _ if c.len() == 1 && c[0].is_ascii_alphanumeric() => c[0].to_ascii_uppercase() as u16,
             _ if c.len() > 1 && c[0] == b'f' => 0x6F + k[1..].parse::<u16>().ok().filter(|n| (1..=12).contains(n))?,
             _ => return None,
@@ -160,6 +161,7 @@ mod tests {
         assert!(b.win && b.shift && !b.ctrl && b.vk() == Some(0x0D));
         assert_eq!(Bind::parse("ctrl+F5").vk(), Some(0x74));
         assert_eq!(Bind::parse("alt+t").vk(), Some(b'T' as u16));
+        assert_eq!(Bind::parse("win+`").vk(), Some(0xC0));
     }
 
     #[test]

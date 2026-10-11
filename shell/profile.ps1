@@ -238,7 +238,7 @@ function global:config {
 
 # ---- `keybinds`: browse Windows hotkeys and switch them on/off (registry-backed) -----------------
 #   keybinds [all|winshortcuts|accessibility|input]   arrows move, left/right/enter toggles, r restarts Explorer, q quits
-#   keybinds disable|enable <letter|winkeys|sticky|filter|toggle|langswitch>   one-shot, no menu
+#   keybinds disable|enable <letter|tab|space|...|winkeys|sticky|filter|toggle|langswitch>   one-shot, no menu
 # Windows keeps no registry list of its shortcuts, so the Win+letter names below are a built-in table.
 # Win+letter changes are only read when Explorer starts; Win+Shift+<letter> follows the letter.
 $kbKeys = @{ A = 'Quick settings'; B = 'Focus tray corner'; C = 'Copilot'; D = 'Show desktop'; E = 'File Explorer'; F = 'Feedback Hub'
@@ -246,6 +246,10 @@ $kbKeys = @{ A = 'Quick settings'; B = 'Focus tray corner'; C = 'Copilot'; D = '
     N = 'Notifications'; O = 'Lock orientation'; P = 'Project / display'; Q = 'Search'; R = 'Run'; S = 'Search'
     T = 'Cycle taskbar'; U = 'Accessibility settings'; V = 'Clipboard history'; W = 'Widgets'; X = 'Power user menu'
     Y = 'Windows Mixed Reality'; Z = 'Snap layouts' }
+# Non-letter Win+ keys: name -> (virtual-key code, what it does). DisabledHotkeys holds one char per VK code.
+$kbSpecial = [ordered]@{ Tab = @(0x09, 'Task view'); Space = @(0x20, 'Switch input language'); Comma = @(0xBC, 'Peek at desktop')
+    Period = @(0xBE, 'Emoji panel'); Plus = @(0xBB, 'Magnifier'); Home = @(0x24, 'Minimize other windows'); Pause = @(0x13, 'System info')
+    PrtScn = @(0x2C, 'Screenshot to file'); Up = @(0x26, 'Maximize'); Down = @(0x28, 'Restore / minimize'); Left = @(0x25, 'Snap left'); Right = @(0x27, 'Snap right') }
 $kbReg = @{
     adv = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
     pol = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
@@ -253,6 +257,12 @@ $kbReg = @{
     tog = 'HKCU:\Keyboard Layout\Toggle'
 }
 $kbFlags = @{ sticky = @('StickyKeys', 'Sticky Keys popup', 'press Shift 5 times'); filter = @('Keyboard Response', 'Filter Keys popup', 'hold right Shift 8s'); toggle = @('ToggleKeys', 'Toggle Keys', 'hold NumLock 5s') }
+
+# The DisabledHotkeys character for a Win+key id, or $null for the other toggles.
+function global:Get-KbChar([string]$id) {
+    if ($id -match '^[A-Z0-9]$') { return $id.ToUpper() }
+    if ($kbSpecial.Contains($id)) { return [string][char]$kbSpecial[$id][0] }
+}
 
 function global:Get-KbValue($path, $name) { (Get-ItemProperty $path -Name $name -ErrorAction SilentlyContinue).$name }
 function global:Set-KbValue($path, $name, $value, $type) {
@@ -262,7 +272,7 @@ function global:Set-KbValue($path, $name, $value, $type) {
 
 # Is the shortcut currently working?
 function global:Get-KbState([string]$id) {
-    if ($id -match '^[A-Z0-9]$') { return "$(Get-KbValue $kbReg.adv 'DisabledHotkeys')" -notmatch $id }
+    if ($c = Get-KbChar $id) { return -not "$(Get-KbValue $kbReg.adv 'DisabledHotkeys')".Contains($c) }
     switch ($id) {
         'winkeys'    { return -not [bool](Get-KbValue $kbReg.pol 'NoWinKeys') }
         'langswitch' { return @('Hotkey', 'Language Hotkey', 'Layout Hotkey' | ForEach-Object { Get-KbValue $kbReg.tog $_ } | Where-Object { $_ -eq '3' }).Count -eq 0 }
@@ -271,9 +281,9 @@ function global:Get-KbState([string]$id) {
 }
 
 function global:Set-KbState([string]$id, [bool]$on) {
-    if ($id -match '^[A-Z0-9]$') {
-        $set = [char[]]"$(Get-KbValue $kbReg.adv 'DisabledHotkeys')" | Where-Object { $_ -ne $id }
-        if (-not $on) { $set += $id }
+    if ($c = Get-KbChar $id) {
+        $set = @([char[]]"$(Get-KbValue $kbReg.adv 'DisabledHotkeys')" | Where-Object { [string]$_ -cne $c })
+        if (-not $on) { $set += [char]$c }
         Set-KbValue $kbReg.adv DisabledHotkeys (-join $set) String
         return
     }
@@ -292,17 +302,18 @@ function global:keybinds {
     $verb = "$($args[0])".ToLower(); $what = "$($args[1])".ToUpper()
     if ($verb -in 'disable', 'enable') {
         $id = if ($what -match '^[A-Z0-9]$') { $what } else { $what.ToLower() }
-        if ($id -notmatch '^[A-Z0-9]$' -and $id -notin 'winkeys', 'langswitch', 'sticky', 'filter', 'toggle') {
-            'usage: keybinds disable|enable <letter|winkeys|sticky|filter|toggle|langswitch>'; return
+        if (-not (Get-KbChar $id) -and $id -notin 'winkeys', 'langswitch', 'sticky', 'filter', 'toggle') {
+            "usage: keybinds disable|enable <letter|$($kbSpecial.Keys -join '|')|winkeys|sticky|filter|toggle|langswitch>"; return
         }
         Set-KbState $id ($verb -eq 'enable')
-        "$id ${verb}d. $(if ($id -match '^[A-Z0-9]$') { 'Open keybinds and press r (or sign out) to apply.' })"
+        "$id ${verb}d. $(if (Get-KbChar $id) { 'Open keybinds and press r (or sign out) to apply.' })"
         return
     }
 
     $groups = [ordered]@{
         winshortcuts  = @(@{ id = 'winkeys'; name = 'All Win shortcuts'; desc = 'every Win+key (sign out to apply)' }) +
-                        @([char[]]'ABCDEFGHIJKLMNOPQRSTUVWXYZ' | Where-Object { $kbKeys["$_"] } | ForEach-Object { @{ id = "$_"; name = "Win+$_"; desc = $kbKeys["$_"] } })
+                        @([char[]]'ABCDEFGHIJKLMNOPQRSTUVWXYZ' | Where-Object { $kbKeys["$_"] } | ForEach-Object { @{ id = "$_"; name = "Win+$_"; desc = $kbKeys["$_"] } }) +
+                        @($kbSpecial.Keys | ForEach-Object { @{ id = $_; name = "Win+$_"; desc = $kbSpecial[$_][1] } })
         accessibility = @($kbFlags.Keys | Sort-Object | ForEach-Object { @{ id = $_; name = $kbFlags[$_][1]; desc = $kbFlags[$_][2] } })
         input         = @(@{ id = 'langswitch'; name = 'Language switch'; desc = 'Alt+Shift changes keyboard language' })
     }
@@ -343,7 +354,7 @@ function global:keybinds {
             if ($key.Key -in 'LeftArrow', 'RightArrow', 'Enter', 'Spacebar' -or $ch -in 'h', 'l') {
                 $it = $items[$sel]
                 Set-KbState $it.id (-not (Get-KbState $it.id))
-                $note = if ($it.id -match '^[A-Z]$') { 'press r to apply' } else { '' }
+                $note = if (Get-KbChar $it.id) { 'press r to apply' } else { '' }
             }
         }
     } finally {
