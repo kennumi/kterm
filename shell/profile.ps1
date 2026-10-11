@@ -65,7 +65,7 @@ $kCfgPath = "$env:APPDATA\kterm\config.json"
 $kCfgDefaults = [ordered]@{
     font_family = 'JetBrainsMono Nerd Font'; font_size = 11.0; opacity = 0.92; padding = 12.0
     cursor_shape = 'block'; cursor_blink = $true; cursor_trail = $true; trail_speed = 1.0
-    accent = 'auto'; gaps = 10.0; hide_user = $false
+    accent = 'auto'; tiling = $true; gaps = 10.0; hide_user = $false
 }
 
 function global:Get-KtermConfig {
@@ -91,12 +91,10 @@ function global:ConvertTo-KtermSgr([string]$hex) {
 function global:Save-KtermConfig($c) {
     # WriteAllText writes no BOM; kterm's JSON parser rejects one.
     [IO.File]::WriteAllText($kCfgPath, ($c | ConvertTo-Json))
-    $global:kHideUser = [bool]$c.hide_user
     $global:kAccent = ConvertTo-KtermSgr $c.accent
 }
 
 $kStartCfg = Get-KtermConfig
-$global:kHideUser = [bool]$kStartCfg.hide_user
 $global:kAccent = ConvertTo-KtermSgr $kStartCfg.accent
 
 function global:hideme {
@@ -134,6 +132,7 @@ function global:config {
         @{ k = 'cursor_trail'; n = 'Cursor trail';      t = 'bool' }
         @{ k = 'trail_speed';  n = 'Trail speed';       t = 'num';  min = 0.25; max = 3;  step = 0.25 }
         @{ k = 'accent';       n = 'Accent color';      t = 'list'; v = $accents }
+        @{ k = 'tiling';       n = 'Auto docking';      t = 'bool' }
         @{ k = 'gaps';         n = 'Tiling gaps';       t = 'num';  min = 0;    max = 40; step = 2 }
         @{ k = 'hide_user';    n = 'Hide username';     t = 'bool' }
         @{ k = 'reset';        n = 'Reset to defaults'; t = 'action' }
@@ -145,7 +144,7 @@ function global:config {
         while ($true) {
             $acc = $global:kAccent
             $sb = New-Object Text.StringBuilder
-            [void]$sb.Append("$e[H$e[2J`r`n  $e[1;38;2;${acc}mkterm config$e[0m`r`n`r`n")
+            [void]$sb.Append("$e[H$e[2J`r`n  $e[1;38;2;${acc}mKTerm config$e[0m`r`n`r`n")
             for ($i = 0; $i -lt $items.Count; $i++) {
                 $it = $items[$i]
                 $v = $c[$it.k]
@@ -204,7 +203,8 @@ function global:config {
                 switch ($it.t) {
                     'num' {
                         $x = [double]$c[$it.k] + $dir * $it.step
-                        $c[$it.k] = [math]::Round([math]::Min($it.max, [math]::Max($it.min, $x)), 2)
+                        # [double] casts: with int min/max PowerShell picks the Int32 overloads and rounds 12.5 to 12.
+                        $c[$it.k] = [math]::Round([math]::Min([double]$it.max, [math]::Max([double]$it.min, $x)), 2)
                     }
                     'bool' { $c[$it.k] = -not [bool]$c[$it.k] }
                     'list' {
@@ -221,14 +221,384 @@ function global:config {
     }
 }
 
+# ---- `benchmark`: record kterm's own CPU / GPU / memory live, then print a summary -------------
+# `benchmark --peak` draws in place in the scrollback instead of on its own page.
+
+function global:benchmark {
+    $procs = @(Get-Process kterm -ErrorAction SilentlyContinue)
+    if (-not $procs) { 'benchmark: kterm is not running'; return }
+    $peak = [bool]($args | Where-Object { $_ -in '--peak', '-peak', '--peek', '-peek' })
+    $ids = $procs.Id
+    $cores = [Environment]::ProcessorCount
+    $spark = ' ' + -join (0x2581..0x2588 | ForEach-Object { [char]$_ })  # block bars; written as code points since this file has no BOM
+    $cpuHist = New-Object Collections.Generic.List[double]
+    $gpuHist = New-Object Collections.Generic.List[double]
+    $memHist = New-Object Collections.Generic.List[double]
+    $lastCpu = ($procs | ForEach-Object { $_.TotalProcessorTime.TotalSeconds } | Measure-Object -Sum).Sum
+    $lastT = [Diagnostics.Stopwatch]::StartNew()
+    $filter = ($ids | ForEach-Object { "Name LIKE 'pid_${_}_%engtype_3D'" }) -join ' OR '
+    $line = {
+        param($hist, $max)
+        $w = [math]::Max(10, [Console]::WindowWidth - 30)
+        $vals = $hist | Select-Object -Last $w
+        -join ($vals | ForEach-Object { $spark[[int][math]::Min(8, [math]::Round($_ / [math]::Max($max, 1e-9) * 8))] })
+    }
+
+    # Inline mode redraws by moving back up over its previous 7 lines; the page mode just clears.
+    $top = if ($peak) { '' } else { "$e[H$e[2J" }
+    [Console]::Write($(if ($peak) { "$e[?25l" } else { "$e[?1049h$e[?25l" }))
+    try {
+        while ($true) {
+            # Sample.
+            $procs = @(Get-Process -Id $ids -ErrorAction SilentlyContinue)
+            if (-not $procs) { break }
+            $cpu = ($procs | ForEach-Object { $_.TotalProcessorTime.TotalSeconds } | Measure-Object -Sum).Sum
+            $secs = $lastT.Elapsed.TotalSeconds; $lastT.Restart()
+            $cpuHist.Add([math]::Max(0, ($cpu - $lastCpu) / $secs / $cores * 100)); $lastCpu = $cpu
+            $gpu = try { (Get-CimInstance Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -Filter $filter -ErrorAction Stop |
+                    Measure-Object UtilizationPercentage -Sum).Sum } catch { 0 }
+            $gpuHist.Add([math]::Min(100, [double]$gpu))
+            $memHist.Add(($procs | Measure-Object WorkingSet64 -Sum).Sum / 1MB)
+
+            # Draw.
+            $acc = $global:kAccent
+            $n = $cpuHist.Count
+            $sb = New-Object Text.StringBuilder
+            [void]$sb.Append("$top`r`n  $e[1;38;2;${acc}mKTerm benchmark$e[0m  $e[2m$n s recorded, pid $($ids -join ', ')$e[0m`r`n`r`n")
+            foreach ($r in @(@('CPU', $cpuHist, '{0,6:0.0} %', 100), @('GPU', $gpuHist, '{0,6:0.0} %', 100), @('RAM', $memHist, '{0,6:0} MB', 0))) {
+                $h = $r[1]
+                $max = if ($r[3]) { [math]::Max(5, ($h | Measure-Object -Maximum).Maximum) } else { ($h | Measure-Object -Maximum).Maximum }
+                [void]$sb.Append(("  $e[1m{0}$e[0m {1}  $e[38;2;${acc}m{2}$e[0m`r`n" -f $r[0], ($r[2] -f $h[$h.Count - 1]), (& $line $h $max)))
+            }
+            [void]$sb.Append("`r`n  $e[2mq quit and show summary$e[0m")
+            [Console]::Write($sb.ToString())
+            if ($peak) { $top = "`r$e[7F$e[J" }
+
+            $until = (Get-Date).AddMilliseconds(1000 - $lastT.ElapsedMilliseconds)
+            while ((Get-Date) -lt $until -and -not [Console]::KeyAvailable) { Start-Sleep -Milliseconds 40 }
+            if ([Console]::KeyAvailable) {
+                $k = [Console]::ReadKey($true)
+                if ($k.Key -eq 'Escape' -or $k.KeyChar -eq 'q') { break }
+            }
+        }
+    } finally {
+        # Inline: wipe the key hint line and keep the graphs above the summary.
+        [Console]::Write($(if ($peak) { "`r$e[K$e[?25h" } else { "$e[?25h$e[?1049l" }))
+    }
+
+    # Summary stays on the normal screen.
+    $acc = $global:kAccent
+    "  $e[1;38;2;${acc}mKTerm usage over $($cpuHist.Count) s$e[0m"
+    foreach ($r in @(@('CPU', $cpuHist, '%'), @('GPU', $gpuHist, '%'), @('RAM', $memHist, 'MB'))) {
+        if (-not $r[1].Count) { continue }
+        $m = $r[1] | Measure-Object -Average -Minimum -Maximum
+        '  {0}  avg {1,7:0.0} {4}   min {2,7:0.0} {4}   peak {3,7:0.0} {4}' -f $r[0], $m.Average, $m.Minimum, $m.Maximum, $r[2]
+    }
+}
+
+# ---- `open <name>`: apps and games by name (`open discord`), or any file, folder or URL --------
+# Run as a fresh window's first command, the window closes after launching; `--stay` keeps it.
+function global:open {
+    $stay = $args -contains '--stay'
+    $q = "$($args | Where-Object { $_ -ne '--stay' })".Trim()
+    if (-not $q) { 'usage: open <app, game, file, folder or url> [--stay]'; return }
+    $ok = $true
+    if ($q -match '^\w[\w+.-]*://') {
+        Start-Process $q
+    } elseif (Test-Path -LiteralPath $q) {
+        Invoke-Item -LiteralPath $q
+        $ok = $?
+    } else {
+        # Start menu apps: Win32, Store, and Steam/Riot/etc. game shortcuts.
+        $apps = @(Get-StartApps | ForEach-Object { [pscustomobject]@{ Name = $_.Name; Target = "shell:AppsFolder\$($_.AppID)" } })
+        # Epic games have no Start menu entry; the launcher's manifests list them.
+        Get-ChildItem "$env:ProgramData\Epic\EpicGamesLauncher\Data\Manifests\*.item" -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $m = Get-Content $_.FullName -Raw | ConvertFrom-Json
+                $apps += [pscustomobject]@{ Name = $m.DisplayName; Target = "com.epicgames.launcher://apps/$($m.CatalogNamespace)%3A$($m.CatalogItemId)%3A$($m.AppName)?action=launch&silent=true" }
+            } catch {}
+        }
+        # Best match: exact name, then starts with, then contains (all case-insensitive).
+        $hit = $apps | Where-Object { $_.Name -eq $q } | Select-Object -First 1
+        if (-not $hit) { $hit = $apps | Where-Object { $_.Name.StartsWith($q, 'OrdinalIgnoreCase') } | Sort-Object { $_.Name.Length } | Select-Object -First 1 }
+        if (-not $hit) { $hit = $apps | Where-Object { $_.Name.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | Sort-Object { $_.Name.Length } | Select-Object -First 1 }
+        if ($hit) {
+            Start-Process explorer.exe "`"$($hit.Target)`""
+            "Opening $($hit.Name)"
+        } else {
+            # Last resort: anything Windows can run by name (PATH, App Paths, e.g. `open notepad`).
+            try { Start-Process $q -ErrorAction Stop } catch { "open: nothing called '$q'"; $ok = $false }
+        }
+    }
+    # The running command joins the history only once it finishes, so no growth since the first
+    # prompt means this is the first command.
+    if ($ok -and -not $stay -and (Get-History).Count -eq $global:kHistBase) { exit }
+}
+
+# Running processes whose name or description contains $q (never this shell itself).
+function global:Find-KtermProcs([string]$q) {
+    $has = { param($s) $s -and $s.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0 }
+    @(Get-Process | Where-Object { $_.Id -ne $PID -and ((& $has $_.ProcessName) -or (& $has $_.Description)) })
+}
+
+# ---- `close <name>`: end a running app. Lists matches and asks which; --all ends every match ----
+function global:close {
+    $all = $args -contains '--all'
+    $q = "$($args | Where-Object { $_ -ne '--all' })".Trim()
+    if (-not $q) { 'usage: close <name> [--all]'; return }
+    $procs = Find-KtermProcs $q
+    if (-not $procs) { "close: nothing running called '$q'"; return }
+
+    # "Important": Windows' own programs, services, and processes too protected to show a path.
+    $svcPids = @(Get-CimInstance Win32_Service -Filter "State='Running'" -ErrorAction SilentlyContinue | ForEach-Object ProcessId)
+    # One entry per program: apps like Discord run several processes from the same exe.
+    $apps = @($procs | Group-Object { "$($_.ProcessName)|$($_.Path)" } | ForEach-Object {
+        $p = $_.Group[0]
+        [pscustomobject]@{
+            Name      = if ($p.Description) { $p.Description } else { $p.ProcessName }
+            Exe       = $p.ProcessName
+            Path      = $p.Path
+            Procs     = $_.Group
+            Important = -not $p.Path -or $p.Path.StartsWith($env:windir, 'OrdinalIgnoreCase') -or
+                        @($_.Group | Where-Object { $svcPids -contains $_.Id }).Count -gt 0
+        }
+    } | Sort-Object Name)
+
+    ''
+    for ($i = 0; $i -lt $apps.Count; $i++) {
+        $a = $apps[$i]
+        $tag = if ($a.Important) { " $e[31m(system/service)$e[0m" } else { '' }
+        $where = if ($a.Path) { $a.Path } else { '(path hidden: system or elevated process)' }
+        "  {0,2}) $e[1m{1}$e[0m  $e[2m{2}.exe, {3} process(es)$e[0m{4}" -f ($i + 1), $a.Name, $a.Exe, $a.Procs.Count, $tag
+        "      $e[2m$where$e[0m"
+    }
+    ''
+    if ($all) {
+        $pick = $apps
+        if ($apps | Where-Object Important) {
+            if ((Read-Host "  This includes system processes or services. Close all $($apps.Count) anyway? (y/N)") -notmatch '^\s*y') { 'Cancelled.'; return }
+        }
+    } else {
+        $ans = Read-Host "  Which one? (1-$($apps.Count), Enter to cancel)"
+        $n = 0
+        if (-not [int]::TryParse($ans, [ref]$n) -or $n -lt 1 -or $n -gt $apps.Count) { 'Cancelled.'; return }
+        $pick = @($apps[$n - 1])
+    }
+
+    foreach ($a in $pick) {
+        $a.Procs | Stop-Process -Force -ErrorAction SilentlyContinue
+        # Some processes exit on their own once their parent goes, so check what is really left.
+        $left = @($a.Procs | Where-Object { Get-Process -Id $_.Id -ErrorAction SilentlyContinue })
+        if ($left) { "  $e[31mCouldn't close $($a.Name)$e[0m (access denied? try an admin terminal)" } else { "  Closed $($a.Name)" }
+    }
+}
+
+# ---- `admin`: reopen this terminal elevated (UAC prompt), in the same folder ------------------
+$kAdminCwd = "$env:APPDATA\kterm\admin-cwd"
+$kIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+function global:admin {
+    if ($kIsAdmin) { 'admin: this terminal is already elevated'; return }
+    $exe = (Get-Process kterm -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+    if (-not $exe) { 'admin: kterm is not running'; return }
+    # Elevation drops the working directory, so hand it over through a file.
+    [IO.File]::WriteAllText($kAdminCwd, $PWD.ProviderPath)
+    try { Start-Process $exe '--admin' -Verb RunAs -ErrorAction Stop } catch { Remove-Item $kAdminCwd; 'admin: cancelled'; return }
+    exit
+}
+
+if ($kIsAdmin -and (Test-Path $kAdminCwd)) {
+    Set-Location -LiteralPath ([IO.File]::ReadAllText($kAdminCwd))
+    Remove-Item $kAdminCwd
+}
+
+# ---- `hide <name>` / `show <name>`: send an app's windows to the tray (or nowhere) and back -----
+# Like Medal's own "hide": the window and its taskbar button go away, the app keeps running, and
+# its tray icon (if it has one) still opens it. `show` brings back what `hide` hid.
+$kHiddenPath = "$env:APPDATA\kterm\hidden.json"
+
+function global:Use-KtermWin {
+    if ('KtermWin' -as [type]) { return }
+    Add-Type @'
+using System; using System.Collections.Generic; using System.Runtime.InteropServices;
+public static class KtermWin {
+    delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
+    [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    public static uint Pid(IntPtr h) { uint pid; GetWindowThreadProcessId(h, out pid); return pid; }
+    // Visible, titled, unowned top-level windows of these processes: the ones with taskbar buttons.
+    public static List<IntPtr> AppWindows(uint[] pids) {
+        var set = new HashSet<uint>(pids); var found = new List<IntPtr>();
+        EnumWindows((h, l) => {
+            if (set.Contains(Pid(h)) && IsWindowVisible(h) && GetWindow(h, 4) == IntPtr.Zero && GetWindowTextLength(h) > 0) found.Add(h);
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
+}
+'@
+}
+
+function global:Get-KtermHidden {
+    # ForEach unrolls the array: 5.1's ConvertFrom-Json emits a whole JSON array as one item.
+    if (Test-Path $kHiddenPath) { try { return @(Get-Content $kHiddenPath -Raw | ConvertFrom-Json | ForEach-Object { $_ }) } catch {} }
+    @()
+}
+
+function global:hide {
+    $q = "$args".Trim()
+    if (-not $q) { 'usage: hide <name>   (bring it back with: show <name>)'; return }
+    Use-KtermWin
+    $procs = Find-KtermProcs $q
+    $wins = if ($procs) { [KtermWin]::AppWindows([uint32[]]@($procs | ForEach-Object Id)) }
+    if (-not $wins) { "hide: no open window for '$q'"; return }
+    $hidden = Get-KtermHidden
+    foreach ($h in $wins) {
+        $p = $procs | Where-Object Id -eq ([KtermWin]::Pid($h)) | Select-Object -First 1
+        $name = if ($p.Description) { $p.Description } else { $p.ProcessName }
+        [void][KtermWin]::ShowWindow($h, 0)  # SW_HIDE
+        $hidden += [pscustomobject]@{ hwnd = [int64]$h; name = $name; exe = $p.ProcessName }
+        "  Hid $name"
+    }
+    # WriteAllText: no BOM, same as config.json.
+    [IO.File]::WriteAllText($kHiddenPath, (ConvertTo-Json @($hidden)))
+    "  $e[2mBring it back with: show $q$e[0m"
+}
+
+function global:show {
+    $q = "$args".Trim()
+    Use-KtermWin
+    $hidden = @(Get-KtermHidden | Where-Object { [KtermWin]::IsWindow([IntPtr]$_.hwnd) })  # drop closed ones
+    $has = { param($s) -not $q -or ($s -and $s.IndexOf($q, [StringComparison]::OrdinalIgnoreCase) -ge 0) }
+    $pick = @($hidden | Where-Object { (& $has $_.name) -or (& $has $_.exe) })
+    if (-not $pick) {
+        if ($hidden) { "show: nothing hidden matches '$q'. Hidden: $(($hidden | ForEach-Object name | Sort-Object -Unique) -join ', ')" }
+        else { 'show: nothing is hidden' }
+    } else {
+        foreach ($w in $pick) {
+            [void][KtermWin]::ShowWindow([IntPtr]$w.hwnd, 5)  # SW_SHOW
+            [void][KtermWin]::SetForegroundWindow([IntPtr]$w.hwnd)
+            "  Showing $($w.name)"
+        }
+    }
+    [IO.File]::WriteAllText($kHiddenPath, (ConvertTo-Json @($hidden | Where-Object { $pick -notcontains $_ })))
+}
+
+# ---- `fetch <url>`: download what a link points to -------------------------------------------
+# Video/audio sites (YouTube, TikTok, ...) go through yt-dlp; anything else (CDN files, Discord
+# attachments, web pages) is saved as-is with curl. Risky-looking links ask before downloading.
+$kMediaHosts = '(^|\.)(youtube\.com|youtu\.be|tiktok\.com|twitter\.com|x\.com|instagram\.com|facebook\.com|fb\.watch|' +
+    'twitch\.tv|kick\.com|vimeo\.com|reddit\.com|redd\.it|soundcloud\.com|bandcamp\.com|dailymotion\.com|bilibili\.com|' +
+    'streamable\.com|medal\.tv|rumble\.com|nicovideo\.jp)$'
+$kRiskyExt = '\.(exe|msi|msix|appx|scr|com|pif|bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|hta|jar|lnk|dll|cpl|reg|iso|img|vhdx?|application|appref-ms)$'
+
+# Reasons a link looks dangerous; empty when nothing stands out.
+function global:Test-KtermUrlRisk([string]$url, [string]$type) {
+    $r = @()
+    try { $u = [Uri]$url } catch { return @('not a valid link') }
+    if ($u.Scheme -ne 'https') { $r += "not encrypted ($($u.Scheme)://), anyone on the network can tamper with it" }
+    if ($u.UserInfo) { $r += "the part before '@' is a disguise; it really goes to $($u.Host)" }
+    if ($u.HostNameType -in 'IPv4', 'IPv6') { $r += 'points at a raw IP address instead of a domain' }
+    if ($u.Host -match '(^|\.)xn--') { $r += "lookalike-letters domain ($($u.IdnHost)) that may imitate a real site" }
+    $file = [Uri]::UnescapeDataString($u.AbsolutePath)
+    if ($file -match $kRiskyExt) { $r += "downloads a program or script ($($Matches[0]))" }
+    if ($file -match '\.(png|jpe?g|gif|webp|pdf|docx?|txt|mp[34])\.\w+$') { $r += 'double file extension, a classic disguise' }
+    if ($type -match 'x-msdownload|x-msdos-program|x-msi|x-sh|x-bat|java-archive') { $r += "server says it's an executable ($type)" }
+    $r
+}
+
+function global:fetch {
+    param(
+        [Parameter(Position = 0)][string]$Url,
+        [string]$Out,           # file or folder; default: current folder
+        [string]$Quality,       # best (default), worst, or a height: 1080, 720p, ...
+        [switch]$Audio,         # audio only
+        [string]$AudioTrack,    # audio language, e.g. en, es, ja (multi-language YouTube videos)
+        [string]$Format,        # container: mp4 (default) / mkv / webm, or with -Audio: mp3 (default) / m4a / opus / wav / flac
+        [switch]$IgnoreWarning, # don't ask before risky links
+        [Parameter(ValueFromRemainingArguments)][string[]]$Rest  # extra yt-dlp flags, e.g. --embed-subs
+    )
+    if (-not $Url) {
+        'usage: fetch <url> [-Out path] [-Quality best|worst|1080] [-Audio] [-AudioTrack en] [-Format mp4|mp3|...] [-IgnoreWarning] [yt-dlp flags]'
+        return
+    }
+    if ($Url -notmatch '^\w[\w+.-]*://') { $Url = "https://$Url" }
+
+    # Follow redirects first (short links, CDN hops) so the checks see where it really goes.
+    $info = @(curl.exe -sIL -o NUL -m 15 -A 'Mozilla/5.0' -w '%{url_effective}\n%{content_type}\n%header{content-disposition}' $Url)
+    $final = if ($info[0]) { $info[0] } else { $Url }
+    $type = "$($info[1])"
+    $risks = @(Test-KtermUrlRisk $Url $type) + @(if ($final -ne $Url) { Test-KtermUrlRisk $final $type }) | Select-Object -Unique
+    if ($risks) {
+        "  $e[1;31mWarning:$e[0m this link looks risky"
+        if ($final -ne $Url) { "  $e[2mit leads to $final$e[0m" }
+        $risks | ForEach-Object { "   - $_" }
+        if (-not $IgnoreWarning -and (Read-Host '  Download anyway? (y/N)') -notmatch '^\s*y') { 'Cancelled.'; return }
+    }
+
+    $media = $Audio -or $Quality -or $AudioTrack -or $Rest -or ([Uri]$final).Host -match $kMediaHosts
+    $dir = $PWD.ProviderPath
+    $name = $null
+    if ($Out) {
+        $Out = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out)
+        if ((Test-Path -LiteralPath $Out -PathType Container) -or $Out -match '[\\/]$') { $dir = $Out }
+        else { $dir = Split-Path $Out; $name = Split-Path $Out -Leaf }
+        [void](New-Item -ItemType Directory -Force $dir)
+    }
+
+    if ($media) {
+        $yt = (Get-Command yt-dlp -ErrorAction SilentlyContinue).Source
+        if (-not $yt) { $yt = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\yt-dlp.exe" }
+        if (-not (Test-Path $yt)) {
+            if ((Read-Host '  Video downloads need yt-dlp (and ffmpeg). Install them with winget now? (Y/n)') -match '^\s*n') { return }
+            winget install -e --id yt-dlp.yt-dlp --accept-source-agreements --accept-package-agreements
+            winget install -e --id yt-dlp.FFmpeg --accept-source-agreements --accept-package-agreements
+            if (-not (Test-Path $yt)) { 'fetch: yt-dlp install failed'; return }
+        }
+        $h = if ($Quality -match '^(\d+)p?$') { "[height<=$($Matches[1])]" } else { '' }
+        $a = if ($AudioTrack) { "ba[language^=$AudioTrack]/ba" } else { 'ba' }
+        $f = if ($Audio) { $a }
+             elseif ($Quality -eq 'worst') { 'wv*+wa/w' }
+             else { "bv*$h+$($a -replace '/ba$', '')/bv*$h+ba/b$h/b" }
+        $ytArgs = @('-f', $f, '-P', $dir, '-o', $(if ($name) { $name } else { '%(title)s [%(id)s].%(ext)s' }))
+        $ytArgs += if ($Audio) { '-x', '--audio-format', $(if ($Format) { $Format } else { 'mp3' }) }
+                   else { '--merge-output-format', $(if ($Format) { $Format } else { 'mp4' }) }
+        if ($IgnoreWarning) { $ytArgs += '--no-warnings' }
+        & $yt @ytArgs @Rest $Url
+        return
+    }
+
+    # Plain file or page: name it after the server's suggestion, else the link's last path part.
+    if (-not $name -and "$($info[2])" -match 'filename\*?=(?:UTF-8'''')?"?([^";]+)') { $name = [Uri]::UnescapeDataString($Matches[1]) }
+    if (-not $name) { $name = [Uri]::UnescapeDataString(([Uri]$final).Segments[-1]).Trim('/') }
+    if (-not $name) { $name = ([Uri]$final).Host }
+    if ($type -match 'text/html' -and $name -notmatch '\.html?$') { $name += '.html' }
+    $name = $name -replace '[<>:"/\\|?*]', '_'
+    $path = Join-Path $dir $name
+    curl.exe -L --fail -# -A 'Mozilla/5.0' -o $path $Url
+    if ($LASTEXITCODE) { "fetch: download failed (curl exit $LASTEXITCODE)"; return }
+    # Mark of the Web, like a browser download: Windows SmartScreen checks it before running it.
+    Set-Content -LiteralPath $path -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3`r`nHostUrl=$final"
+    "  Saved $path ({0:N0} KB)" -f ((Get-Item -LiteralPath $path).Length / 1KB)
+}
+
 # ---- Arch-style prompt:  user@host ~/path >  (accent colored, red after a failure) -----------
 function global:prompt {
     $ok = $?
+    # History before the first command (kterm's startup -Command counts as an entry); see `open`.
+    if ($null -eq $global:kHistBase) { $global:kHistBase = (Get-History).Count }
     $acc = if ($global:kAccent) { "38;2;$global:kAccent" } else { '34' }
-    $user = if ($global:kHideUser) { '*****' } else { $env:USERNAME }
+    $user = $env:USERNAME  # kterm stars it on screen when hide_user is on
     $p = $PWD.ProviderPath
     if ($p.StartsWith($HOME, [StringComparison]::OrdinalIgnoreCase)) { $p = '~' + $p.Substring($HOME.Length) }
     $p = $p -replace '\\', '/'
+    $Host.UI.RawUI.WindowTitle = $p  # names this terminal in KTerm's tray menu
     $arrow = if ($ok) { $acc } else { '31' }
     "$e[1;${acc}m$user@$($env:COMPUTERNAME.ToLower())$e[0m $e[1m$p$e[0m $e[${arrow}m$([char]0x276F)$e[0m "
 }

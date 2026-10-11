@@ -48,6 +48,7 @@ pub struct Shared {
     pub cfg: Config,
     pub theme: Theme,
     pub palette: [Rgb; 269],
+    pub user: Vec<char>, // %USERNAME%, masked on screen when `hide_user` is on
 }
 
 impl Shared {
@@ -146,6 +147,22 @@ fn build_palette(t: &Theme) -> [Rgb; 269] {
     p
 }
 
+/// Start of every case-insensitive, non-overlapping match of `needle` in `hay`. Matches span row
+/// ends too, so a name wrapped onto the next line is still found.
+fn find_ci(hay: &[char], needle: &[char]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while !needle.is_empty() && i + needle.len() <= hay.len() {
+        if hay[i..i + needle.len()].iter().zip(needle).all(|(a, b)| a.to_lowercase().eq(b.to_lowercase())) {
+            out.push(i);
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 fn dim(c: Rgb) -> Rgb {
     c.map(|x| (x as u16 * 2 / 3) as u8)
 }
@@ -195,6 +212,8 @@ pub struct TermWin {
     scroll_px: f64,
     last_frame: Instant,
     pub activity: Instant,
+    /// Still animating: the app draws the next frame from `about_to_wait`.
+    pub wants_frame: bool,
     bell: Option<Instant>,
     grab: (bool, Instant), // pointer over the move frame, since when
     cells: Vec<CellInst>,
@@ -228,6 +247,7 @@ impl TermWin {
             scroll_px: 0.0,
             last_frame: now,
             activity: now,
+            wants_frame: false,
             bell: None,
             grab: (false, now),
             cells: Vec::with_capacity(16384),
@@ -278,7 +298,7 @@ impl TermWin {
     pub fn move_to(&mut self, to: Rect) {
         if self.rect() != to {
             self.motion = Some(Motion { from: self.rect(), to, start: Instant::now() });
-            self.window.request_redraw();
+            self.wants_frame = true;
         }
     }
 
@@ -327,6 +347,8 @@ impl TermWin {
             }
             TermEvent::TextAreaSizeRequest(f) => self.write(f(grid_size(&self.window, sh)).into_bytes()),
             TermEvent::ChildExit(_) => return true,
+            TermEvent::Title(t) => self.window.set_title(&t),
+            TermEvent::ResetTitle => self.window.set_title("KTerm"),
             _ => {}
         }
         false
@@ -334,22 +356,26 @@ impl TermWin {
 
     // ---- input -------------------------------------------------------------------------------
 
-    pub fn on_key(&mut self, ev: KeyEvent) {
+    /// Returns true when the key asks to close this window (Ctrl+W).
+    pub fn on_key(&mut self, ev: KeyEvent) -> bool {
         if ev.state != ElementState::Pressed || self.closing {
-            return;
+            return false;
         }
         let m = self.mods;
         if let Key::Character(c) = &ev.logical_key {
+            if m.control_key() && !m.alt_key() && c.eq_ignore_ascii_case("w") {
+                return true;
+            }
             if m.control_key() && !m.alt_key() && c.eq_ignore_ascii_case("c") {
                 // Ctrl+Shift+C always copies; Ctrl+C copies only when there is a selection.
                 if m.shift_key() || self.s.term.lock().selection.is_some() {
                     self.copy();
-                    return;
+                    return false;
                 }
             }
             if m.control_key() && m.shift_key() && c.eq_ignore_ascii_case("v") {
                 self.paste();
-                return;
+                return false;
             }
         }
         let app_cursor = self.s.term.lock().mode().contains(TermMode::APP_CURSOR);
@@ -362,6 +388,7 @@ impl TermWin {
             self.activity = Instant::now();
             self.write(bytes);
         }
+        false
     }
 
     fn copy(&mut self) {
@@ -525,6 +552,7 @@ impl TermWin {
     // ---- drawing -----------------------------------------------------------------------------
 
     pub fn draw(&mut self, sh: &mut Shared) {
+        self.wants_frame = false;
         if self.closed {
             return;
         }
@@ -581,7 +609,9 @@ impl TermWin {
         let content = term.renderable_content();
         let offset = content.display_offset as i32;
         let (cols, lines) = (term.columns(), term.screen_lines());
+        let mut text = Vec::new(); // the screen's chars, one per cell, for `hideme`
         for cell in content.display_iter {
+            text.push(cell.c);
             let (row, col) = ((cell.point.line.0 + offset) as u32, cell.point.column.0 as u32);
             let flags = cell.flags;
             let mut fg = resolve(&sh.palette, content.colors, cell.fg);
@@ -617,6 +647,16 @@ impl TermWin {
                 fg: pack(fg, 255),
                 bg: pack(bg, if bg_default { 0 } else { 255 }),
             });
+        }
+        // `hideme`: draw the username as stars wherever it shows up. Only the drawing changes, so
+        // copying still gets the real text.
+        if sh.cfg.hide_user {
+            let star = sh.gpu.glyph('*', 0, scale);
+            for i in find_ci(&text, &sh.user) {
+                for c in &mut self.cells[i..i + sh.user.len()] {
+                    c.glyph = star;
+                }
+            }
         }
 
         // Cursor + kitty trail.
@@ -699,9 +739,7 @@ impl TermWin {
         if std::mem::take(&mut sh.gpu.atlas_reset) {
             animating = true;
         }
-        if animating {
-            self.window.request_redraw();
-        }
+        self.wants_frame = animating;
     }
 }
 
@@ -787,4 +825,17 @@ fn key_bytes(ev: &KeyEvent, m: ModifiersState, app_cursor: bool) -> Option<Vec<u
         _ => return None,
     };
     Some(s.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_ci;
+
+    #[test]
+    fn finds_username_any_case() {
+        let hay: Vec<char> = r"C:\Users\Yousif\x yousifYOUSIF".chars().collect();
+        let user: Vec<char> = "Yousif".chars().collect();
+        assert_eq!(find_ci(&hay, &user), vec![9, 18, 24]);
+        assert!(find_ci(&hay, &[]).is_empty());
+    }
 }

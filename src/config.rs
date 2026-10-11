@@ -21,8 +21,9 @@ pub struct Config {
     pub cursor_trail: bool,
     pub trail_speed: f32, // 1 = kitty's default; higher is faster
     pub accent: String,   // "auto" (Windows accent) or "#rrggbb"
+    pub tiling: bool,     // off: new windows cascade over the others instead
     pub gaps: f32,        // tiling gaps, logical px
-    pub hide_user: bool,  // read by the shell prompt
+    pub hide_user: bool,  // shell prompt + on-screen masking of %USERNAME%
 }
 
 impl Default for Config {
@@ -37,6 +38,7 @@ impl Default for Config {
             cursor_trail: true,
             trail_speed: 1.0,
             accent: "auto".into(),
+            tiling: true,
             gaps: 10.0,
             hide_user: false,
         }

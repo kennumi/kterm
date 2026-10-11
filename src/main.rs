@@ -16,8 +16,9 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::monitor::MonitorHandle;
-use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows};
-use winit::window::{Window, WindowId};
+use winit::dpi::PhysicalSize;
+use winit::platform::windows::{CornerPreference, IconExtWindows, WindowAttributesExtWindows, WindowExtWindows};
+use winit::window::{Icon, Window, WindowId};
 
 use config::Config;
 use render::Gpu;
@@ -32,6 +33,10 @@ pub enum UserEvent {
     Toggle,
     /// Shift+Win+Enter: always open another terminal, tiling it next to the others.
     NewWindow,
+    /// Tray menu: bring this terminal forward.
+    Focus(WindowId),
+    /// Tray menu: close every terminal and exit.
+    Quit,
     Accent,
 }
 
@@ -80,6 +85,7 @@ struct App {
     cfg_pending: bool, // a check was throttled; do it when the poll interval is up
     start_hidden: bool,
     started: bool,
+    admin: bool,
     _accent_watch: Option<windows::UI::ViewManagement::UISettings>,
 }
 
@@ -113,12 +119,34 @@ impl App {
         dwindle(area, n, gap)
     }
 
+    /// With tiling off, the next window opens a step down-right of the newest one, like Windows'
+    /// own cascade, starting over at the floating spot once that would leave the work area.
+    fn cascade_rect(&self, m: &MonitorHandle) -> Rect {
+        let name = m.name();
+        let Some(prev) = self.wins.iter().rev().find(|w| !w.is_closing() && monitor_name(&w.window) == name) else {
+            return self.floating_rect(m);
+        };
+        let step = (32.0 * m.scale_factor()).round() as i32;
+        let (x, y, w, h) = prev.rect();
+        let (p, s) = (m.position(), m.size());
+        let area = win::work_area(p.x + s.width as i32 / 2, p.y + s.height as i32 / 2);
+        if x + step + w > area.0 + area.2 || y + step + h > area.1 + area.3 {
+            return self.floating_rect(m);
+        }
+        (x + step, y + step, w, h)
+    }
+
     /// Re-tile every live window on monitor `m`.
     fn relayout(&mut self, m: &MonitorHandle) {
         let name = m.name();
         let idx: Vec<usize> = (0..self.wins.len())
             .filter(|&i| !self.wins[i].is_closing() && monitor_name(&self.wins[i].window) == name)
             .collect();
+        if self.sh.as_ref().is_some_and(|sh| !sh.cfg.tiling) {
+            // Windows stay where they are; each is floating, so its spot is remembered again.
+            idx.iter().for_each(|&i| self.wins[i].tiled = false);
+            return;
+        }
         let rects = self.layout(m, idx.len());
         for (&i, r) in idx.iter().zip(rects) {
             self.wins[i].tiled = idx.len() > 1;
@@ -136,7 +164,8 @@ impl App {
     fn open_window(&mut self, el: &ActiveEventLoop) {
         let Some(m) = monitor_at(el, win::cursor_pos()) else { return };
         let attrs = Window::default_attributes()
-            .with_title("kterm")
+            .with_title("KTerm")
+            .with_skip_taskbar(true) // lives in the tray instead
             .with_decorations(false)
             .with_transparent(true)
             .with_visible(false)
@@ -146,6 +175,11 @@ impl App {
             .with_corner_preference(CornerPreference::Round)
             .with_position(m.position()); // start on the right monitor so DPI is right from frame one
         let Ok(window) = el.create_window(attrs) else { return };
+        // Load the icon (embedded by build.rs) at this monitor's DPI; the default size is 96-DPI and blurs.
+        let icon = |px: f64| Icon::from_resource(1, Some(PhysicalSize::new(px as u32, px as u32))).ok();
+        let sf = window.scale_factor();
+        window.set_window_icon(icon((16.0 * sf).round()));
+        window.set_taskbar_icon(icon((32.0 * sf).round())); // Alt+Tab
         let window = Arc::new(window);
 
         let surf = match &mut self.sh {
@@ -155,7 +189,7 @@ impl App {
                 self.cfg_mtime = config::mtime();
                 let (gpu, surf) = Gpu::new(window.clone(), &cfg.font_family, cfg.font_size);
                 let theme = Self::theme(&cfg);
-                let mut sh = Shared { gpu, cfg, theme, palette: [[0; 3]; 269] };
+                let mut sh = Shared { gpu, cfg, theme, palette: [[0; 3]; 269], user: std::env::var("USERNAME").unwrap_or_default().chars().collect() };
                 sh.set_theme(Self::theme(&sh.cfg));
                 self.sh = Some(sh);
                 surf
@@ -163,7 +197,8 @@ impl App {
         };
         let name = m.name();
         let siblings = self.wins.iter().filter(|w| !w.is_closing() && monitor_name(&w.window) == name).count();
-        let rect = *self.layout(&m, siblings + 1).last().unwrap();
+        let tiling = self.sh.as_ref().unwrap().cfg.tiling;
+        let rect = if tiling { *self.layout(&m, siblings + 1).last().unwrap() } else { self.cascade_rect(&m) };
         let sh = self.sh.as_mut().unwrap();
         let w = TermWin::new(window, surf, rect, &self.proxy, sh);
         self.last_focus = Some(w.window.id());
@@ -244,7 +279,7 @@ impl App {
             }
             w.window.request_redraw();
         }
-        if old.gaps != sh.cfg.gaps {
+        if old.gaps != sh.cfg.gaps || old.tiling != sh.cfg.tiling {
             self.relayout_all();
         }
     }
@@ -288,7 +323,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::ModifiersChanged(m) => w.mods = m.state(),
-            WindowEvent::KeyboardInput { event, .. } => w.on_key(event),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if w.on_key(event) {
+                    self.close(i);
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => w.on_cursor_moved(position, sh),
             WindowEvent::MouseInput { state, button, .. } => w.on_mouse(state, button, sh),
             WindowEvent::MouseWheel { delta, .. } => w.on_wheel(delta, sh),
@@ -302,6 +341,15 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Toggle => self.toggle(el),
             UserEvent::NewWindow => self.open_window(el),
+            UserEvent::Focus(id) => {
+                if let Some(i) = self.find(id) {
+                    self.wins[i].window.focus_window();
+                }
+            }
+            UserEvent::Quit => {
+                win::remove_tray_icon();
+                el.exit(); // dropping the sessions ends their shells
+            }
             UserEvent::Accent => {
                 if let Some(sh) = &mut self.sh
                     && sh.cfg.accent().is_none()
@@ -325,10 +373,26 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         self.reap();
+        if self.admin && self.started && self.wins.is_empty() {
+            el.exit();
+            return;
+        }
+        let live = self.wins.iter().filter(|w| !w.is_closing()).map(|w| (w.window.id(), w.window.title()));
+        *win::TERMINALS.lock().unwrap() = live.collect();
+        // Animation frames are drawn here rather than via request_redraw: winit dispatches only one
+        // RedrawRequested per loop round, so a window that always wants another frame (blinking
+        // cursor) would starve the rest, e.g. tiled windows wouldn't glide until clicked.
+        if let Some(sh) = self.sh.as_mut() {
+            for w in self.wins.iter_mut().filter(|w| w.wants_frame) {
+                w.draw(sh);
+            }
+        }
         if self.cfg_pending {
             self.reload_config();
         }
-        el.set_control_flow(if self.cfg_pending {
+        el.set_control_flow(if self.wins.iter().any(|w| w.wants_frame) {
+            ControlFlow::Poll // paced by the Fifo present
+        } else if self.cfg_pending {
             ControlFlow::WaitUntil(self.cfg_checked + CONFIG_POLL)
         } else {
             ControlFlow::Wait
@@ -344,7 +408,10 @@ fn main() {
         }
         return;
     }
-    if win::signal_existing_instance() {
+    // `--admin`: the elevated terminal the shell's `admin` command opens. A separate process that
+    // skips the single-instance handoff, tray and hotkey, and exits with its last window.
+    let admin = args.iter().any(|a| a == "--admin");
+    if !admin && win::signal_existing_instance() {
         return;
     }
     // Release builds have no console: leave panics somewhere findable.
@@ -358,7 +425,10 @@ fn main() {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build().expect("event loop");
     let proxy = event_loop.create_proxy();
     win::set_proxy(proxy.clone());
-    win::spawn_hotkey_thread();
+    win::spawn_hotkey_thread(admin);
+    if !admin {
+        win::spawn_tray_thread();
+    }
     event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = App {
         proxy,
@@ -371,6 +441,7 @@ fn main() {
         cfg_pending: false,
         start_hidden: args.iter().any(|a| a == "--hidden"),
         started: false,
+        admin,
         _accent_watch: win::watch_accent(),
     };
     event_loop.run_app(&mut app).expect("event loop");

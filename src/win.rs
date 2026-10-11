@@ -1,4 +1,4 @@
-//! Win32 glue: Win+Enter hotkey, accent color, single instance, clipboard, per-monitor placement.
+//! Win32 glue: Win+Enter hotkey, tray icon, accent color, single instance, clipboard, per-monitor placement.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,12 +11,15 @@ use windows::UI::ViewManagement::{UIColorType, UISettings};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
 use windows::Win32::System::DataExchange::*;
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Memory::*;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::*;
+use windows::Win32::UI::Shell::{NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 use winit::event_loop::EventLoopProxy;
+use winit::window::WindowId;
 
 use crate::UserEvent;
 use crate::theme::{FALLBACK_ACCENT, Rgb};
@@ -45,10 +48,13 @@ pub fn send(e: UserEvent) {
 // swallows the keystroke for us; we only need to see it. Raw Input does that without the timeouts
 // that make Windows 11 silently drop low-level keyboard hooks, and only wakes us on key events.
 
-pub fn spawn_hotkey_thread() {
-    std::thread::spawn(|| unsafe {
+/// `admin`: an elevated `--admin` instance runs beside the normal one. It keeps the window as
+/// clipboard owner but leaves the hotkey and launch messages to the normal instance.
+pub fn spawn_hotkey_thread(admin: bool) {
+    std::thread::spawn(move || unsafe {
+        let title = if admin { w!("kterm-ipc-admin") } else { IPC_TITLE };
         let Ok(sink) = CreateWindowExW(
-            Default::default(), w!("STATIC"), IPC_TITLE, Default::default(),
+            Default::default(), w!("STATIC"), title, Default::default(),
             0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None,
         ) else {
             return;
@@ -57,6 +63,11 @@ pub fn spawn_hotkey_thread() {
         HWND_RAW.store(sink.0 as isize, Ordering::Relaxed);
         let toggle_msg = toggle_message();
         let keyboard = RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: RIDEV_INPUTSINK, hwndTarget: sink };
+        if admin {
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
+            return;
+        }
         if RegisterRawInputDevices(&[keyboard], size_of::<RAWINPUTDEVICE>() as u32).is_err() {
             eprintln!("kterm: can't watch the keyboard for Win+Enter");
             return;
@@ -96,6 +107,140 @@ pub fn spawn_hotkey_thread() {
             }
         }
     });
+}
+
+// ---- Tray icon -------------------------------------------------------------------------------
+// Terminals stay off the taskbar; this icon lists them. Left click = Win+Enter, right click = menu.
+
+/// Live terminals in tiling order, with their titles. Kept current by the event loop.
+pub static TERMINALS: Mutex<Vec<(WindowId, String)>> = Mutex::new(Vec::new());
+static TRAY: AtomicIsize = AtomicIsize::new(0);
+const WM_TRAY: u32 = WM_APP + 1;
+const CMD_NEW: usize = 1;
+const CMD_QUIT: usize = 2;
+const CMD_TERM: usize = 100; // + index into TERMINALS
+
+pub fn spawn_tray_thread() {
+    std::thread::spawn(|| unsafe {
+        let Ok(inst) = GetModuleHandleW(None) else { return };
+        let class = w!("kterm-tray");
+        let wc = WNDCLASSW { lpfnWndProc: Some(tray_proc), hInstance: inst.into(), lpszClassName: class, ..Default::default() };
+        RegisterClassW(&wc);
+        // A real (never shown) top-level window: message-only ones miss TaskbarCreated.
+        let Ok(hwnd) = CreateWindowExW(
+            WS_EX_TOOLWINDOW, class, w!("KTerm"), WINDOW_STYLE::default(),
+            0, 0, 0, 0, None, None, Some(inst.into()), None,
+        ) else {
+            return;
+        };
+        TRAY.store(hwnd.0 as isize, Ordering::Relaxed);
+        allow_dark_menus(hwnd);
+        add_tray_icon(hwnd);
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            DispatchMessageW(&msg);
+        }
+    });
+}
+
+/// Lets the menu follow Windows' dark mode. uxtheme's ordinals 133/135/136 are undocumented but have
+/// been stable since 1903 (Explorer and most tray apps use them); if missing, menus just stay light.
+unsafe fn allow_dark_menus(hwnd: HWND) {
+    unsafe {
+        let Ok(ux) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        let get = |n: usize| GetProcAddress(ux, PCSTR(n as *const u8));
+        if let Some(f) = get(135) {
+            std::mem::transmute::<_, extern "system" fn(i32) -> i32>(f)(1); // SetPreferredAppMode(AllowDark)
+        }
+        if let Some(f) = get(133) {
+            std::mem::transmute::<_, extern "system" fn(HWND, bool) -> bool>(f)(hwnd, true); // AllowDarkModeForWindow
+        }
+        if let Some(f) = get(136) {
+            std::mem::transmute::<_, extern "system" fn()>(f)(); // FlushMenuThemes
+        }
+    }
+}
+
+fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW { cbSize: size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() }
+}
+
+unsafe fn add_tray_icon(hwnd: HWND) {
+    let mut nid = tray_data(hwnd);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY;
+    unsafe {
+        let size = GetSystemMetrics(SM_CXSMICON);
+        let inst = GetModuleHandleW(None).unwrap_or_default();
+        // Resource 1: the app icon, embedded by build.rs.
+        if let Ok(h) = LoadImageW(Some(inst.into()), PCWSTR(1 as _), IMAGE_ICON, size, size, LR_DEFAULTCOLOR) {
+            nid.hIcon = HICON(h.0);
+        }
+        for (d, s) in nid.szTip.iter_mut().zip("KTerm".encode_utf16()) {
+            *d = s;
+        }
+        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
+    }
+}
+
+pub fn remove_tray_icon() {
+    let hwnd = TRAY.load(Ordering::Relaxed);
+    if hwnd != 0 {
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_DELETE, &tray_data(HWND(hwnd as *mut _)));
+        }
+    }
+}
+
+unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe {
+        if msg == WM_TRAY {
+            match lp.0 as u32 {
+                WM_LBUTTONUP => send(UserEvent::Toggle),
+                WM_RBUTTONUP => show_tray_menu(hwnd),
+                _ => {}
+            }
+            return LRESULT(0);
+        }
+        if msg == RegisterWindowMessageW(w!("TaskbarCreated")) {
+            add_tray_icon(hwnd); // Explorer restarted and forgot us
+        }
+        DefWindowProcW(hwnd, msg, wp, lp)
+    }
+}
+
+unsafe fn show_tray_menu(hwnd: HWND) {
+    let terms = TERMINALS.lock().unwrap().clone();
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        if terms.is_empty() {
+            let _ = AppendMenuW(menu, MF_GRAYED, 0, w!("No open terminals"));
+        }
+        for (i, (_, title)) in terms.iter().enumerate() {
+            // Numbered (&1 = press 1) since several terminals often share a folder name.
+            let label = format!("&{}   {}", i + 1, title.replace('&', "&&"));
+            let _ = AppendMenuW(menu, MF_STRING, CMD_TERM + i, &HSTRING::from(label));
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let _ = AppendMenuW(menu, MF_STRING, CMD_NEW, w!("New terminal\tShift+Win+Enter"));
+        let _ = AppendMenuW(menu, MF_STRING, CMD_QUIT, w!("Terminate"));
+        let (x, y) = cursor_pos();
+        // Without the foreground dance the menu won't close when clicking elsewhere.
+        let _ = SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, x, y, None, hwnd, None).0 as usize;
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = DestroyMenu(menu);
+        match cmd {
+            CMD_NEW => send(UserEvent::NewWindow),
+            CMD_QUIT => send(UserEvent::Quit),
+            n if n >= CMD_TERM => {
+                if let Some(&(id, _)) = terms.get(n - CMD_TERM) {
+                    send(UserEvent::Focus(id));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // ---- Accent color ----------------------------------------------------------------------------
