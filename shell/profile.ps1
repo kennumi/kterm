@@ -755,7 +755,7 @@ function global:kterm-update {
 
 if ($env:KTERM_VERSION) {
     $kAge = (Get-Item $kRelease -ErrorAction SilentlyContinue).LastWriteTime
-    if (-not $kAge -or $kAge -lt (Get-Date).AddHours(-6)) {
+    if (-not $kAge -or $kAge -lt (Get-Date).AddMinutes(-10)) {
         # Written to a temp file and moved, so a shell starting mid-download never reads half of it.
         Start-Process cmd.exe -WindowStyle Hidden -ArgumentList '/c', "curl.exe -sfL --max-time 20 -o `"$kRelease.tmp`" https://api.github.com/repos/kennumi/kterm/releases/latest && move /y `"$kRelease.tmp`" `"$kRelease`" >nul"
     }
