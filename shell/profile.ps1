@@ -66,6 +66,7 @@ $kCfgDefaults = [ordered]@{
     font_family = 'JetBrainsMono Nerd Font'; font_size = 11.0; opacity = 0.92; padding = 12.0
     cursor_shape = 'block'; cursor_blink = $true; cursor_trail = $true; trail_speed = 1.0
     accent = 'auto'; tiling = $true; gaps = 10.0; hide_user = $false
+    key_toggle = 'win+enter'; key_new = 'win+shift+enter'; key_close = 'ctrl+w'; key_hide = 'ctrl+shift+h'; key_copy = 'ctrl+shift+c'; key_paste = 'ctrl+shift+v'
 }
 
 function global:Get-KtermConfig {
@@ -135,6 +136,12 @@ function global:config {
         @{ k = 'tiling';       n = 'Auto docking';      t = 'bool' }
         @{ k = 'gaps';         n = 'Tiling gaps';       t = 'num';  min = 0;    max = 40; step = 2 }
         @{ k = 'hide_user';    n = 'Hide username';     t = 'bool' }
+        @{ k = 'key_toggle';   n = 'Key: open/hide all'; t = 'key' }
+        @{ k = 'key_new';      n = 'Key: new window';   t = 'key' }
+        @{ k = 'key_close';    n = 'Key: close';        t = 'key' }
+        @{ k = 'key_hide';     n = 'Key: hide';         t = 'key' }
+        @{ k = 'key_copy';     n = 'Key: copy';         t = 'key' }
+        @{ k = 'key_paste';    n = 'Key: paste';        t = 'key' }
         @{ k = 'reset';        n = 'Reset to defaults'; t = 'action' }
     )
     $sel = 0
@@ -152,6 +159,7 @@ function global:config {
                     'bool'   { if ($v) { 'on' } else { 'off' } }
                     'num'    { '{0:0.##}' -f [double]$v }
                     'action' { '' }
+                    'key'    { $v }
                     default {
                         if ($it.k -eq 'accent') {
                             $label = if ($v -eq 'auto') { 'auto (Windows)' } else { $v }
@@ -168,7 +176,7 @@ function global:config {
                     [void]$sb.Append(("    $e[2m{0,-18}$e[0m   {1}`r`n" -f $it.n, $val))
                 }
             }
-            [void]$sb.Append("`r`n  $e[2mup/down select   left/right change   enter custom color   q quit$e[0m")
+            [void]$sb.Append("`r`n  $e[2mup/down select   left/right change   enter custom color / key   q quit$e[0m")
             [Console]::Write($sb.ToString())
 
             # Wait for a key, but redraw if the terminal resizes (e.g. after a font size change);
@@ -199,6 +207,13 @@ function global:config {
                 [Console]::Write("$e[?25l")
                 if ($hex -and $hex -notmatch '^#') { $hex = "#$hex" }
                 if ($hex -match '^#[0-9a-fA-F]{6}$') { $c.accent = $hex.ToLower() }
+            } elseif ($it.t -eq 'key') {
+                if ($key.Key -ne 'Enter') { continue }
+                # Typed, not pressed: kterm's own binds would swallow the keystroke before the shell sees it.
+                [Console]::Write("$e[?25h`r`n`r`n")
+                $combo = (Read-Host '  Key, e.g. ctrl+shift+h; ctrl/shift/alt/win + (letters, digits, f1-f12, escape, enter, tab, space)').Trim().ToLower()
+                [Console]::Write("$e[?25l")
+                if ($combo -match '^((ctrl|shift|alt|win)\+)*([a-z0-9]|f\d{1,2}|esc|escape|enter|tab|space|backspace)$') { $c[$it.k] = $combo }
             } else {
                 switch ($it.t) {
                     'num' {
@@ -215,6 +230,121 @@ function global:config {
                 }
             }
             Save-KtermConfig $c
+        }
+    } finally {
+        [Console]::Write("$e[?25h$e[?1049l")
+    }
+}
+
+# ---- `keybinds`: browse Windows hotkeys and switch them on/off (registry-backed) -----------------
+#   keybinds [all|winshortcuts|accessibility|input]   arrows move, left/right/enter toggles, r restarts Explorer, q quits
+#   keybinds disable|enable <letter|winkeys|sticky|filter|toggle|langswitch>   one-shot, no menu
+# Windows keeps no registry list of its shortcuts, so the Win+letter names below are a built-in table.
+# Win+letter changes are only read when Explorer starts; Win+Shift+<letter> follows the letter.
+$kbKeys = @{ A = 'Quick settings'; B = 'Focus tray corner'; C = 'Copilot'; D = 'Show desktop'; E = 'File Explorer'; F = 'Feedback Hub'
+    G = 'Game Bar'; H = 'Voice typing'; I = 'Settings'; J = 'Tips / focus'; K = 'Cast'; L = 'Lock screen'; M = 'Minimize all'
+    N = 'Notifications'; O = 'Lock orientation'; P = 'Project / display'; Q = 'Search'; R = 'Run'; S = 'Search'
+    T = 'Cycle taskbar'; U = 'Accessibility settings'; V = 'Clipboard history'; W = 'Widgets'; X = 'Power user menu'
+    Y = 'Windows Mixed Reality'; Z = 'Snap layouts' }
+$kbReg = @{
+    adv = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+    pol = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+    acc = 'HKCU:\Control Panel\Accessibility'
+    tog = 'HKCU:\Keyboard Layout\Toggle'
+}
+$kbFlags = @{ sticky = @('StickyKeys', 'Sticky Keys popup', 'press Shift 5 times'); filter = @('Keyboard Response', 'Filter Keys popup', 'hold right Shift 8s'); toggle = @('ToggleKeys', 'Toggle Keys', 'hold NumLock 5s') }
+
+function global:Get-KbValue($path, $name) { (Get-ItemProperty $path -Name $name -ErrorAction SilentlyContinue).$name }
+function global:Set-KbValue($path, $name, $value, $type) {
+    if (-not (Test-Path $path)) { New-Item $path -Force | Out-Null }
+    Set-ItemProperty $path $name $value -Type $type
+}
+
+# Is the shortcut currently working?
+function global:Get-KbState([string]$id) {
+    if ($id -match '^[A-Z0-9]$') { return "$(Get-KbValue $kbReg.adv 'DisabledHotkeys')" -notmatch $id }
+    switch ($id) {
+        'winkeys'    { return -not [bool](Get-KbValue $kbReg.pol 'NoWinKeys') }
+        'langswitch' { return @('Hotkey', 'Language Hotkey', 'Layout Hotkey' | ForEach-Object { Get-KbValue $kbReg.tog $_ } | Where-Object { $_ -eq '3' }).Count -eq 0 }
+        default      { $f = Get-KbValue "$($kbReg.acc)\$($kbFlags[$id][0])" 'Flags'; return ($null -ne $f) -and [bool]([int]$f -band 4) }  # 4 = HOTKEYACTIVE
+    }
+}
+
+function global:Set-KbState([string]$id, [bool]$on) {
+    if ($id -match '^[A-Z0-9]$') {
+        $set = [char[]]"$(Get-KbValue $kbReg.adv 'DisabledHotkeys')" | Where-Object { $_ -ne $id }
+        if (-not $on) { $set += $id }
+        Set-KbValue $kbReg.adv DisabledHotkeys (-join $set) String
+        return
+    }
+    switch ($id) {
+        'winkeys'    { Set-KbValue $kbReg.pol NoWinKeys ([int](-not $on)) DWord }
+        'langswitch' { foreach ($n in 'Hotkey', 'Language Hotkey', 'Layout Hotkey') { Set-KbValue $kbReg.tog $n $(if ($on) { '1' } else { '3' }) String } }  # 3 = none, 1 = Alt+Shift
+        default {
+            $k = "$($kbReg.acc)\$($kbFlags[$id][0])"
+            $f = [int](Get-KbValue $k 'Flags')
+            Set-KbValue $k Flags ([string]$(if ($on) { $f -bor 4 } else { $f -band -bnot 4 })) String
+        }
+    }
+}
+
+function global:keybinds {
+    $verb = "$($args[0])".ToLower(); $what = "$($args[1])".ToUpper()
+    if ($verb -in 'disable', 'enable') {
+        $id = if ($what -match '^[A-Z0-9]$') { $what } else { $what.ToLower() }
+        if ($id -notmatch '^[A-Z0-9]$' -and $id -notin 'winkeys', 'langswitch', 'sticky', 'filter', 'toggle') {
+            'usage: keybinds disable|enable <letter|winkeys|sticky|filter|toggle|langswitch>'; return
+        }
+        Set-KbState $id ($verb -eq 'enable')
+        "$id ${verb}d. $(if ($id -match '^[A-Z0-9]$') { 'Open keybinds and press r (or sign out) to apply.' })"
+        return
+    }
+
+    $groups = [ordered]@{
+        winshortcuts  = @(@{ id = 'winkeys'; name = 'All Win shortcuts'; desc = 'every Win+key (sign out to apply)' }) +
+                        @([char[]]'ABCDEFGHIJKLMNOPQRSTUVWXYZ' | Where-Object { $kbKeys["$_"] } | ForEach-Object { @{ id = "$_"; name = "Win+$_"; desc = $kbKeys["$_"] } })
+        accessibility = @($kbFlags.Keys | Sort-Object | ForEach-Object { @{ id = $_; name = $kbFlags[$_][1]; desc = $kbFlags[$_][2] } })
+        input         = @(@{ id = 'langswitch'; name = 'Language switch'; desc = 'Alt+Shift changes keyboard language' })
+    }
+    $view = if ($verb -eq 'display') { "$($args[1])".ToLower() } else { $verb }
+    if ($view -notin $groups.Keys) { $view = 'all' }
+    $items = @(if ($view -eq 'all') { $groups.Values | ForEach-Object { $_ } } else { $groups[$view] })
+    $sel = 0; $top = 0; $note = ''
+
+    [Console]::Write("$e[?1049h$e[?25l")
+    try {
+        while ($true) {
+            $acc = $global:kAccent
+            $rows = [Math]::Max(3, [Console]::WindowHeight - 6)
+            if ($sel -lt $top) { $top = $sel } elseif ($sel -ge $top + $rows) { $top = $sel - $rows + 1 }
+            $sb = New-Object Text.StringBuilder
+            [void]$sb.Append("$e[H$e[2J`r`n  $e[1;38;2;${acc}mKTerm keybinds$e[0m  $e[2m$view$e[0m`r`n`r`n")
+            for ($i = $top; $i -lt [Math]::Min($items.Count, $top + $rows); $i++) {
+                $it = $items[$i]
+                $st = if (Get-KbState $it.id) { "$e[32mon $e[0m" } else { "$e[31moff$e[0m" }
+                if ($i -eq $sel) {
+                    [void]$sb.Append(("  $e[1;38;2;${acc}m> {0,-20}$e[0m $e[38;2;${acc}m<$e[0m$st$e[38;2;${acc}m>$e[0m  $e[2m{1}$e[0m`r`n" -f $it.name, $it.desc))
+                } else {
+                    [void]$sb.Append(("    $e[2m{0,-20}$e[0m  {1}   $e[2m{2}$e[0m`r`n" -f $it.name, $st, $it.desc))
+                }
+            }
+            [void]$sb.Append("`r`n  $e[2mup/down select   left/right/enter toggle   r restart Explorer   q quit$e[0m  $note")
+            [Console]::Write($sb.ToString())
+
+            $size = "$([Console]::WindowWidth)x$([Console]::WindowHeight)"
+            while (-not [Console]::KeyAvailable -and "$([Console]::WindowWidth)x$([Console]::WindowHeight)" -eq $size) { Start-Sleep -Milliseconds 40 }
+            if (-not [Console]::KeyAvailable) { continue }
+            $key = [Console]::ReadKey($true)
+            $ch = [string]$key.KeyChar
+            if ($key.Key -eq 'Escape' -or $ch -eq 'q') { return }
+            if ($key.Key -eq 'UpArrow' -or $ch -eq 'k') { $sel = ($sel - 1 + $items.Count) % $items.Count; continue }
+            if ($key.Key -eq 'DownArrow' -or $ch -eq 'j') { $sel = ($sel + 1) % $items.Count; continue }
+            if ($ch -eq 'r') { Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue; $note = 'Explorer restarted'; continue }
+            if ($key.Key -in 'LeftArrow', 'RightArrow', 'Enter', 'Spacebar' -or $ch -in 'h', 'l') {
+                $it = $items[$sel]
+                Set-KbState $it.id (-not (Get-KbState $it.id))
+                $note = if ($it.id -match '^[A-Z]$') { 'press r to apply' } else { '' }
+            }
         }
     } finally {
         [Console]::Write("$e[?25h$e[?1049l")

@@ -38,6 +38,9 @@ pub enum UserEvent {
     /// Tray menu: close every terminal and exit.
     Quit,
     Accent,
+    /// Global close / hide binds that use Win (the window never sees those keys).
+    CloseFocused,
+    HideFocused,
 }
 
 /// Dwindle tiling (Hyprland's default): each window takes half of what's left, splitting along the
@@ -242,6 +245,7 @@ impl App {
             .find(|w| Some(w.window.id()) == self.last_focus)
             .or_else(|| self.wins.iter().filter(live).last())
         {
+            w.window.set_visible(true);
             w.window.focus_window();
         } else {
             self.open_window(el);
@@ -267,6 +271,7 @@ impl App {
             return;
         }
         let old = std::mem::replace(&mut sh.cfg, new);
+        win::set_hotkeys(&sh.cfg);
         let font = sh.gpu.set_font(&sh.cfg.font_family, sh.cfg.font_size);
         if old.accent != sh.cfg.accent {
             sh.set_theme(Self::theme(&sh.cfg));
@@ -324,7 +329,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => w.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if w.on_key(event) {
+                if w.on_key(event, &sh.cfg) {
                     self.close(i);
                 }
             }
@@ -343,12 +348,23 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::NewWindow => self.open_window(el),
             UserEvent::Focus(id) => {
                 if let Some(i) = self.find(id) {
+                    self.wins[i].window.set_visible(true);
                     self.wins[i].window.focus_window();
                 }
             }
             UserEvent::Quit => {
                 win::remove_tray_icon();
                 el.exit(); // dropping the sessions ends their shells
+            }
+            UserEvent::CloseFocused | UserEvent::HideFocused => {
+                let hide = matches!(event, UserEvent::HideFocused);
+                if let Some(i) = self.wins.iter().position(|w| !w.is_closing() && w.window.has_focus()) {
+                    if hide {
+                        self.wins[i].window.set_visible(false);
+                    } else {
+                        self.close(i);
+                    }
+                }
             }
             UserEvent::Accent => {
                 if let Some(sh) = &mut self.sh
@@ -404,6 +420,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--install") {
         if let Err(e) = win::install_autostart() {
+            eprintln!("kterm: {e}");
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--update") {
+        if let Err(e) = win::self_update() {
             eprintln!("kterm: {e}");
         }
         return;

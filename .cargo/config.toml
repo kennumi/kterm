@@ -1,0 +1,5 @@
+[alias]
+# `cargo ship`: rebuild and swap into the installed KTerm, then restart it.
+ship = "run --release -- --update"
+# `cargo release [minor|major]`: bump version, build installer, publish GitHub release.
+release = "run -q --manifest-path xtask/Cargo.toml --"

@@ -23,7 +23,7 @@ use winit::platform::windows::WindowExtWindows;
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId};
 
 use crate::UserEvent;
-use crate::config::Config;
+use crate::config::{Config, key_matches};
 use crate::cursor::Trail;
 use crate::render::{CellInst, Gpu, QuadInst, Surface, pack, rect};
 use crate::theme::{Rgb, Theme};
@@ -356,27 +356,35 @@ impl TermWin {
 
     // ---- input -------------------------------------------------------------------------------
 
-    /// Returns true when the key asks to close this window (Ctrl+W).
-    pub fn on_key(&mut self, ev: KeyEvent) -> bool {
+    /// Returns true when the key asks to close this window (`key_close`).
+    pub fn on_key(&mut self, ev: KeyEvent, cfg: &Config) -> bool {
         if ev.state != ElementState::Pressed || self.closing {
             return false;
         }
         let m = self.mods;
-        if let Key::Character(c) = &ev.logical_key {
-            if m.control_key() && !m.alt_key() && c.eq_ignore_ascii_case("w") {
-                return true;
-            }
-            if m.control_key() && !m.alt_key() && c.eq_ignore_ascii_case("c") {
-                // Ctrl+Shift+C always copies; Ctrl+C copies only when there is a selection.
-                if m.shift_key() || self.s.term.lock().selection.is_some() {
-                    self.copy();
-                    return false;
-                }
-            }
-            if m.control_key() && m.shift_key() && c.eq_ignore_ascii_case("v") {
-                self.paste();
-                return false;
-            }
+        let hit = |spec: &str| key_matches(spec, &ev, m);
+        if hit(&cfg.key_close) {
+            return true;
+        }
+        if hit(&cfg.key_hide) {
+            self.window.set_visible(false); // shell keeps running; Win+Enter / tray brings it back
+            return false;
+        }
+        if hit(&cfg.key_copy) {
+            self.copy();
+            return false;
+        }
+        if hit(&cfg.key_paste) {
+            self.paste();
+            return false;
+        }
+        // Ctrl+C copies when there is a selection, otherwise it is the shell's interrupt.
+        if let Key::Character(c) = &ev.logical_key
+            && m.control_key() && !m.alt_key() && !m.shift_key() && c.eq_ignore_ascii_case("c")
+            && self.s.term.lock().selection.is_some()
+        {
+            self.copy();
+            return false;
         }
         let app_cursor = self.s.term.lock().mode().contains(TermMode::APP_CURSOR);
         if let Some(bytes) = key_bytes(&ev, m, app_cursor) {

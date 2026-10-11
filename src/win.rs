@@ -1,4 +1,4 @@
-//! Win32 glue: Win+Enter hotkey, tray icon, accent color, single instance, clipboard, per-monitor placement.
+//! Win32 glue: global hotkeys (Win+Enter by default), tray icon, accent color, single instance, clipboard, per-monitor placement.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,6 +22,7 @@ use winit::event_loop::EventLoopProxy;
 use winit::window::WindowId;
 
 use crate::UserEvent;
+use crate::config::{Bind, Config};
 use crate::theme::{FALLBACK_ACCENT, Rgb};
 
 pub const CLASS: &str = "kterm";
@@ -32,6 +33,14 @@ static PROXY: Mutex<Option<EventLoopProxy<UserEvent>>> = Mutex::new(None);
 pub static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
 /// Title of the hidden message window other kterm launches post to.
 const IPC_TITLE: PCWSTR = w!("kterm-ipc");
+
+// toggle, new window, close, hide. Close and hide are only global when they use Win: Windows never
+// delivers those to the window, so the window can't see them itself.
+static HOTKEYS: Mutex<Option<[Bind; 4]>> = Mutex::new(None);
+
+pub fn set_hotkeys(cfg: &Config) {
+    *HOTKEYS.lock().unwrap() = Some([&cfg.key_toggle, &cfg.key_new, &cfg.key_close, &cfg.key_hide].map(|k| Bind::parse(k)));
+}
 
 pub fn set_proxy(p: EventLoopProxy<UserEvent>) {
     *PROXY.lock().unwrap() = Some(p);
@@ -72,7 +81,9 @@ pub fn spawn_hotkey_thread(admin: bool) {
             eprintln!("kterm: can't watch the keyboard for Win+Enter");
             return;
         }
-        let (mut win_down, mut shift_down, mut enter_down) = (false, false, false);
+        set_hotkeys(&Config::load());
+        let (mut ctrl, mut shift, mut alt, mut win) = (false, false, false, false);
+        let mut pressed = [false; 256];
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == toggle_msg {
@@ -93,15 +104,27 @@ pub fn spawn_hotkey_thread(admin: bool) {
             let kb = raw.data.keyboard;
             let down = kb.Flags as u32 & RI_KEY_BREAK == 0;
             match kb.VKey {
-                0x5B | 0x5C => win_down = down,          // VK_LWIN, VK_RWIN
-                0x10 | 0xA0 | 0xA1 => shift_down = down, // VK_SHIFT, VK_LSHIFT, VK_RSHIFT
-                0x0D => {
-                    // Windows' own reservation eats the press, so usually only the release
-                    // arrives. Toggle on whichever comes first; ignore auto-repeat.
-                    if win_down && !enter_down {
-                        send(if shift_down { UserEvent::NewWindow } else { UserEvent::Toggle });
+                0x5B | 0x5C => win = down,           // VK_LWIN, VK_RWIN
+                0x10 | 0xA0 | 0xA1 => shift = down,  // VK_SHIFT, VK_LSHIFT, VK_RSHIFT
+                0x11 | 0xA2 | 0xA3 => ctrl = down,   // VK_CONTROL, VK_LCONTROL, VK_RCONTROL
+                0x12 | 0xA4 | 0xA5 => alt = down,    // VK_MENU, VK_LMENU, VK_RMENU
+                vk if vk < 256 => {
+                    // A reserved combo (Win+Enter) has its press eaten by Windows, so usually only
+                    // the release arrives. Fire on whichever comes first; ignore auto-repeat.
+                    if !pressed[vk as usize]
+                        && let Some(binds) = HOTKEYS.lock().unwrap().clone()
+                        && let Some(i) = binds.iter().enumerate().position(|(i, b)| {
+                            (i < 2 || b.win) && b.vk() == Some(vk) && b.mods_match(ctrl, shift, alt, win)
+                        })
+                    {
+                        send(match i {
+                            0 => UserEvent::Toggle,
+                            1 => UserEvent::NewWindow,
+                            2 => UserEvent::CloseFocused,
+                            _ => UserEvent::HideFocused,
+                        });
                     }
-                    enter_down = down;
+                    pressed[vk as usize] = down;
                 }
                 _ => {}
             }
@@ -385,4 +408,23 @@ pub fn install_autostart() -> std::io::Result<()> {
         .arg(format!("\"{}\" --hidden", exe.display()))
         .status()?;
     if status.success() { Ok(()) } else { Err(std::io::Error::other("reg add failed")) }
+}
+
+/// `kterm --update` (via `cargo ship`): replace the installed kterm.exe with this build and restart it.
+/// A detached PowerShell does it, since stopping the old copy may close the terminal running us.
+pub fn self_update() -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    let src = std::env::current_exe()?;
+    let dest = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap_or_default()).join(r"Programs\KTerm\kterm.exe");
+    if !dest.exists() {
+        return Err(std::io::Error::other(format!("not installed at {}", dest.display())));
+    }
+    let (s, d) = (src.display(), dest.display());
+    let script = format!(
+        "Get-Process kterm -EA 0 | ? Path -eq '{d}' | Stop-Process -Force; Start-Sleep -Milliseconds 700; \
+         Copy-Item '{s}' '{d}' -Force; Start-Process '{d}' '--hidden'; Start-Sleep 1; Start-Process '{d}'"
+    );
+    // CREATE_NO_WINDOW | DETACHED_PROCESS
+    std::process::Command::new("powershell").args(["-NoProfile", "-Command", &script]).creation_flags(0x0800_0200).spawn()?;
+    Ok(())
 }
