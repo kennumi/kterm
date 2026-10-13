@@ -239,7 +239,7 @@ function global:config {
 
 # ---- `keybinds`: browse Windows hotkeys and switch them on/off (registry-backed) -----------------
 #   keybinds [all|winshortcuts|accessibility|input]   arrows move, left/right/enter toggles, r restarts Explorer, q quits
-#   keybinds disable|enable <letter|tab|space|...|winkeys|sticky|filter|toggle|langswitch>   one-shot, no menu
+#   keybinds disable|enable <letter|tab|space|...|winkeys|sticky|filter|toggle|mousekeys|highcontrast|narrator|colorfilter|langswitch>   one-shot, no menu
 # Windows keeps no registry list of its shortcuts, so the Win+letter names below are a built-in table.
 # Win+letter changes are only read when Explorer starts; Win+Shift+<letter> follows the letter.
 $kbKeys = @{ A = 'Quick settings'; B = 'Focus tray corner'; C = 'Copilot'; D = 'Show desktop'; E = 'File Explorer'; F = 'Feedback Hub'
@@ -257,7 +257,11 @@ $kbReg = @{
     acc = 'HKCU:\Control Panel\Accessibility'
     tog = 'HKCU:\Keyboard Layout\Toggle'
 }
-$kbFlags = @{ sticky = @('StickyKeys', 'Sticky Keys popup', 'press Shift 5 times'); filter = @('Keyboard Response', 'Filter Keys popup', 'hold right Shift 8s'); toggle = @('ToggleKeys', 'Toggle Keys', 'hold NumLock 5s') }
+$kbFlags = @{ sticky = @('StickyKeys', 'Sticky Keys popup', 'press Shift 5 times'); filter = @('Keyboard Response', 'Filter Keys popup', 'hold right Shift 8s'); toggle = @('ToggleKeys', 'Toggle Keys', 'hold NumLock 5s')
+    mousekeys = @('MouseKeys', 'Mouse Keys', 'left Alt+left Shift+NumLock'); highcontrast = @('HighContrast', 'High Contrast', 'left Alt+left Shift+PrtScn') }
+# Hotkeys with their own on/off DWORD: id -> (key, value, name, keys, default when unset).
+$kbDword = [ordered]@{ narrator = @('HKCU:\Software\Microsoft\Narrator\NoRoam', 'WinEnterLaunchEnabled', 'Narrator', 'Win+Ctrl+Enter', 1)
+    colorfilter = @('HKCU:\Software\Microsoft\ColorFiltering', 'HotkeyEnabled', 'Color filters', 'Win+Ctrl+C', 0) }
 
 # The DisabledHotkeys character for a Win+key id, or $null for the other toggles.
 function global:Get-KbChar([string]$id) {
@@ -276,6 +280,7 @@ function global:Get-KbState([string]$id) {
     if ($c = Get-KbChar $id) { return -not "$(Get-KbValue $kbReg.adv 'DisabledHotkeys')".Contains($c) }
     switch ($id) {
         'winkeys'    { return -not [bool](Get-KbValue $kbReg.pol 'NoWinKeys') }
+        { $kbDword.Contains($_) } { $d = $kbDword[$id]; $v = Get-KbValue $d[0] $d[1]; return [bool]$(if ($null -eq $v) { $d[4] } else { $v }) }
         'langswitch' { return @('Hotkey', 'Language Hotkey', 'Layout Hotkey' | ForEach-Object { Get-KbValue $kbReg.tog $_ } | Where-Object { $_ -eq '3' }).Count -eq 0 }
         default      { $f = Get-KbValue "$($kbReg.acc)\$($kbFlags[$id][0])" 'Flags'; return ($null -ne $f) -and [bool]([int]$f -band 4) }  # 4 = HOTKEYACTIVE
     }
@@ -290,6 +295,7 @@ function global:Set-KbState([string]$id, [bool]$on) {
     }
     switch ($id) {
         'winkeys'    { Set-KbValue $kbReg.pol NoWinKeys ([int](-not $on)) DWord }
+        { $kbDword.Contains($_) } { Set-KbValue $kbDword[$id][0] $kbDword[$id][1] ([int]$on) DWord }
         'langswitch' { foreach ($n in 'Hotkey', 'Language Hotkey', 'Layout Hotkey') { Set-KbValue $kbReg.tog $n $(if ($on) { '1' } else { '3' }) String } }  # 3 = none, 1 = Alt+Shift
         default {
             $k = "$($kbReg.acc)\$($kbFlags[$id][0])"
@@ -303,8 +309,9 @@ function global:keybinds {
     $verb = "$($args[0])".ToLower(); $what = "$($args[1])".ToUpper()
     if ($verb -in 'disable', 'enable') {
         $id = if ($what -match '^[A-Z0-9]$') { $what } else { $what.ToLower() }
-        if (-not (Get-KbChar $id) -and $id -notin 'winkeys', 'langswitch', 'sticky', 'filter', 'toggle') {
-            "usage: keybinds disable|enable <letter|$($kbSpecial.Keys -join '|')|winkeys|sticky|filter|toggle|langswitch>"; return
+        $named = @('winkeys', 'langswitch') + $kbFlags.Keys + $kbDword.Keys
+        if (-not (Get-KbChar $id) -and $id -notin $named) {
+            "usage: keybinds disable|enable <letter|$($kbSpecial.Keys -join '|')|$($named -join '|')>"; return
         }
         Set-KbState $id ($verb -eq 'enable')
         "$id ${verb}d. $(if (Get-KbChar $id) { 'Open keybinds and press r (or sign out) to apply.' })"
@@ -315,7 +322,8 @@ function global:keybinds {
         winshortcuts  = @(@{ id = 'winkeys'; name = 'All Win shortcuts'; desc = 'every Win+key (sign out to apply)' }) +
                         @([char[]]'ABCDEFGHIJKLMNOPQRSTUVWXYZ' | Where-Object { $kbKeys["$_"] } | ForEach-Object { @{ id = "$_"; name = "Win+$_"; desc = $kbKeys["$_"] } }) +
                         @($kbSpecial.Keys | ForEach-Object { @{ id = $_; name = "Win+$_"; desc = $kbSpecial[$_][1] } })
-        accessibility = @($kbFlags.Keys | Sort-Object | ForEach-Object { @{ id = $_; name = $kbFlags[$_][1]; desc = $kbFlags[$_][2] } })
+        accessibility = @($kbDword.Keys | ForEach-Object { @{ id = $_; name = $kbDword[$_][2]; desc = $kbDword[$_][3] } }) +
+                        @($kbFlags.Keys | Sort-Object | ForEach-Object { @{ id = $_; name = $kbFlags[$_][1]; desc = $kbFlags[$_][2] } })
         input         = @(@{ id = 'langswitch'; name = 'Language switch'; desc = 'Alt+Shift changes keyboard language' })
     }
     $view = if ($verb -eq 'display') { "$($args[1])".ToLower() } else { $verb }
