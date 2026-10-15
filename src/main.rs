@@ -29,7 +29,7 @@ const CONFIG_POLL: Duration = Duration::from_millis(200);
 
 pub enum UserEvent {
     Term(WindowId, TermEvent),
-    /// Win+Enter: close the focused terminal, else focus one, else open one.
+    /// Win+Enter: hide the focused terminal, else show one on the cursor's monitor, else open one there.
     Toggle,
     /// Shift+Win+Enter: always open another terminal, tiling it next to the others.
     NewWindow,
@@ -235,16 +235,15 @@ impl App {
     }
 
     fn toggle(&mut self, el: &ActiveEventLoop) {
-        let live = |w: &&TermWin| !w.is_closing();
-        if let Some(i) = self.wins.iter().position(|w| !w.is_closing() && w.window.has_focus()) {
-            self.close(i);
-        } else if let Some(w) = self
-            .wins
-            .iter()
-            .filter(live)
-            .find(|w| Some(w.window.id()) == self.last_focus)
-            .or_else(|| self.wins.iter().filter(live).last())
-        {
+        // Hide, never close: only key_close / `exit` end a terminal.
+        if let Some(w) = self.wins.iter().find(|w| !w.is_closing() && w.window.has_focus()) {
+            w.window.set_visible(false);
+            return;
+        }
+        // Summon a terminal on the monitor under the cursor, not one on another screen.
+        let here = monitor_at(el, win::cursor_pos()).and_then(|m| m.name());
+        let local: Vec<&TermWin> = self.wins.iter().filter(|w| !w.is_closing() && monitor_name(&w.window) == here).collect();
+        if let Some(w) = local.iter().find(|w| Some(w.window.id()) == self.last_focus).or(local.last()) {
             w.window.set_visible(true);
             w.window.focus_window();
         } else {
